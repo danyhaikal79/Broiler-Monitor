@@ -22,9 +22,14 @@ def is_logged_in() -> bool:
     return bool(st.session_state.get("auth_user"))
 
 
-def current_user() -> dict | None:
+def current_user():
     u = st.session_state.get("auth_user")
-    return ACCOUNTS.get(u) | {"username": u} if u else None
+    if not u:
+        return None
+    acc = ACCOUNTS.get(u)
+    if acc is None:
+        return None
+    return {**acc, "username": u}   # 3.8-safe merge (dict | dict is 3.9+)
 
 
 def current_role() -> str | None:
