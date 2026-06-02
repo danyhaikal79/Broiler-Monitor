@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+env/
+
+# Generated at runtime (regenerated automatically)
+**/data_train.yaml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Datasets / training artifacts should NOT be in this deploy repo.
+# (Only the two deployed model weights are intentionally included.)
+*.zip
+*.mp4
+*.avi
