@@ -1,0 +1,37 @@
+# Thin image: take an Ultralytics-on-Jetson base (which already has the right
+# Python 3.8 + PyTorch-CUDA + OpenCV for your L4T version) and add Streamlit.
+#
+# The BASE_IMAGE is passed at build time and DEPENDS ON YOUR JETPACK/L4T VERSION.
+# Find your version first (see deploy/README_JETSON.md), then build with e.g.:
+#   docker build -f deploy/Dockerfile.jetson \
+#       --build-arg BASE_IMAGE=dustynv/ultralytics:r32.7.1 \
+#       -t broiler-monitor:jetson .
+#
+# We do NOT copy the project into the image — it's mounted at runtime (run_jetson.sh)
+# so the models/config stay editable and the image stays small.
+
+# Default base = Ultralytics' official JetPack-4 image (Python 3.8 + PyTorch-CUDA +
+# ultralytics, built for L4T r32 / the original Jetson Nano). Override with
+# --build-arg BASE_IMAGE=... if needed.
+ARG BASE_IMAGE=ultralytics/ultralytics:latest-jetson-jetpack4
+FROM ${BASE_IMAGE}
+
+# Streamlit + pure-python deps the dashboard needs that may not be in the base.
+# (ultralytics, opencv, numpy, pillow, pyyaml are already in the base image.)
+#   - streamlit            : the dashboard UI
+#   - pandas               : streamlit charts
+#   - pyserial             : read the DHT-22 over USB serial (/dev/ttyUSB0)
+#   - streamlit-autorefresh: live sensor auto-refresh
+#   - requests             : Supabase REST + Telegram (worker/db/notify) — usually
+#                            already in the base; pinned here to be safe
+RUN python3 -m pip install --no-cache-dir \
+        "streamlit>=1.30,<2" "pandas" "pyserial" "streamlit-autorefresh" "requests" \
+    || pip3 install --no-cache-dir "streamlit>=1.30,<2" "pandas" "pyserial" "streamlit-autorefresh" "requests"
+
+WORKDIR /app
+EXPOSE 8500
+
+# Default command (overridden by run_jetson.sh). Project is mounted at /app.
+CMD ["python3", "-m", "streamlit", "run", \
+     "new_dashboard/super_finalise_dashboard/app.py", \
+     "--server.address", "0.0.0.0", "--server.port", "8500"]

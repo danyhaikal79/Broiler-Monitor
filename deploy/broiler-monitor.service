@@ -1,0 +1,35 @@
+# systemd unit: auto-start Broiler Monitor (worker + dashboard) on Jetson boot.
+#
+# 1. EDIT the two paths/devices below to match your Jetson:
+#      - the -v project path  (where you put full_system3 on the Jetson)
+#      - --device lines        (remove one if that device isn't plugged in)
+# 2. Install it:
+#      sudo cp deploy/broiler-monitor.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now broiler-monitor
+# 3. Check it:   systemctl status broiler-monitor
+#    Live logs:  journalctl -u broiler-monitor -f
+#    Stop:       sudo systemctl stop broiler-monitor   (disable = don't start on boot)
+
+[Unit]
+Description=Broiler Monitor (worker + dashboard) in Docker
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=10
+# Clean up any leftover container from a previous run (the leading "-" ignores errors).
+ExecStartPre=-/usr/bin/docker stop broiler-monitor
+ExecStartPre=-/usr/bin/docker rm broiler-monitor
+# EDIT: project path on the Jetson, and drop a --device line if that device is absent.
+ExecStart=/usr/bin/docker run --rm --name broiler-monitor \
+  --runtime nvidia --network host \
+  --device /dev/video0 --device /dev/ttyUSB0 \
+  -v /home/jetson/full_system3:/app -w /app \
+  broiler-monitor:jetson bash deploy/start_jetson.sh
+ExecStop=/usr/bin/docker stop broiler-monitor
+
+[Install]
+WantedBy=multi-user.target

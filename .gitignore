@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+env/
+
+# Generated at runtime (regenerated automatically)
+**/data_train.yaml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Datasets / training artifacts should NOT be in this deploy repo.
+# (Only the two deployed model weights are intentionally included.)
+*.zip
+*.mp4
+*.avi
+
+# Secrets + runtime DB (NEVER commit these)
+monitor_config.json
+*.sqlite
+*.sqlite3
+
+# Worker <-> dashboard runtime control/handoff files (regenerated at runtime)
+monitor_control.json
+monitor_latest.json
+monitor_latest_frame.jpg
+monitor_upload_request.json
+monitor_upload_result.json
+*.tmp

@@ -1,0 +1,5 @@
+# Shell scripts + systemd unit run on the Jetson (Linux) — keep them LF so bash
+# doesn't choke on CRLF ("\r: bad interpreter") even when committed from Windows.
+*.sh        text eol=lf
+*.service   text eol=lf
+deploy/*    text eol=lf

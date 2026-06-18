@@ -1,0 +1,5 @@
+# Cap browser uploads so a huge file can't blow up RAM on the Jetson.
+# (The dashboard also rejects >64 MB in code; this stops the upload earlier.)
+# Picked up when Streamlit is run with this folder as the working directory.
+[server]
+maxUploadSize = 64
