@@ -21,6 +21,8 @@ Thumbs.db
 *.zip
 *.mp4
 *.avi
+# TensorRT engines are device/JetPack-specific — build them on the Jetson, don't commit.
+*.engine
 
 # Secrets + runtime DB (NEVER commit these)
 monitor_config.json

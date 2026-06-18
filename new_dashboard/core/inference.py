@@ -68,6 +68,15 @@ _chicken_model = None
 _PREDICT_LOCK = threading.Lock()
 
 
+def _prefer_engine(pt_path: Path) -> Path:
+    """Prefer a TensorRT .engine next to the .pt if it exists — much faster + lighter
+    on Jetson. Build it ON the device with:
+        yolo export model=<best.pt> format=engine half=True
+    Resolved at LOAD time (not import) so it's picked up after you export on the Jetson."""
+    engine = pt_path.with_suffix(".engine")
+    return engine if engine.exists() else pt_path
+
+
 def feeder_method_available(method: int = 1) -> bool:
     """True if the weights for this method exist (Method 2 may be untrained)."""
     return FEEDER_WEIGHTS_BY_METHOD.get(method, FEEDER_WEIGHTS).exists()
@@ -75,9 +84,10 @@ def feeder_method_available(method: int = 1) -> bool:
 
 def load_feeder_model(method: int = 1):
     """Lazy-load + cache the feeder model for the chosen method. Cached by WEIGHTS PATH
-    so methods sharing a model (e.g. Method 3 → Method 2's weights) load it only once."""
+    so methods sharing a model (e.g. Method 3 → Method 2's weights) load it only once.
+    Uses the TensorRT .engine if one has been exported next to the .pt."""
     global _feeder_models
-    weights = FEEDER_WEIGHTS_BY_METHOD.get(method, FEEDER_WEIGHTS)
+    weights = _prefer_engine(FEEDER_WEIGHTS_BY_METHOD.get(method, FEEDER_WEIGHTS))
     key = str(weights)
     if key not in _feeder_models:
         from ultralytics import YOLO
@@ -93,9 +103,10 @@ def load_chicken_model():
     global _chicken_model
     if _chicken_model is None:
         from ultralytics import YOLO
-        if not CHICKEN_WEIGHTS.exists():
-            raise FileNotFoundError(f"Chicken weights not found: {CHICKEN_WEIGHTS}")
-        _chicken_model = YOLO(str(CHICKEN_WEIGHTS))
+        weights = _prefer_engine(CHICKEN_WEIGHTS)
+        if not weights.exists():
+            raise FileNotFoundError(f"Chicken weights not found: {weights}")
+        _chicken_model = YOLO(str(weights))
     return _chicken_model
 
 
