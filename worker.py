@@ -260,6 +260,17 @@ def main():
     high_temp = float(cfg.get("high_temp_alert_c", 38))
     poll = max(1.0, min(5.0, float(interval)))   # control-flag + upload-inbox check cadence
 
+    # Pre-warm the YOLO models so the FIRST capture/upload isn't a slow cold-load.
+    # On a Jetson Nano this one-time load is ~30-90s; doing it now (at boot) keeps the
+    # first user action responsive instead of timing out.
+    try:
+        print("[worker] loading models (one-time warm-up, can take ~30-90s on Jetson)…")
+        inference.load_feeder_model(method)
+        inference.load_chicken_model()
+        print("[worker] models ready.")
+    except Exception as e:
+        print(f"[worker] model warm-up skipped ({e}); will load on first use.")
+
     print(f"[worker] started · method={method} · interval={interval}s · poll={poll:.0f}s · "
           f"low-feed<{low_thr}% · supabase={'on' if config.is_supabase_configured(cfg) else 'OFF'} · "
           f"telegram={'on' if config.is_telegram_configured(cfg) else 'OFF'}")

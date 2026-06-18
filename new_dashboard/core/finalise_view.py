@@ -251,9 +251,9 @@ def render(role: str | None = None, show_header: bool = True):
         # waiting — poll, but time out so a missing/stopped worker doesn't hang the UI forever
         t0 = st.session_state.get("fin_upload_wait_t0") or time.time()
         st.session_state["fin_upload_wait_t0"] = t0
-        if time.time() - t0 > 30:
-            st.error("⚠️ No result after 30s — is **worker.py** running on this device? "
-                     "Re-select the file, or check the worker.")
+        if time.time() - t0 > 120:
+            st.error("⚠️ No result after 120s — is **worker.py** running? (The first analysis on a "
+                     "Jetson loads the AI models and can take a minute.) Re-select the file to retry.")
             return
         try:
             from streamlit_autorefresh import st_autorefresh
