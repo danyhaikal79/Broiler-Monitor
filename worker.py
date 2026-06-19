@@ -54,12 +54,14 @@ def _read_env(cfg):
 class Shared:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.cam_lock = threading.Lock()        # serialise camera access (loop vs /frame)
         self._contact_lock = threading.Lock()
         self.last_contact_t = 0.0               # last time the dashboard pinged/fetched
         self.latest_env = (float(cfg.get("temperature_fallback_c", 25.0)),
                            float(cfg.get("humidity_fallback_pct", 70.0)))
-        self._cap = None                        # PERSISTENT camera handle (see capture_pil)
+        self._cap = None                        # camera handle (owned ONLY by the grabber thread)
+        self._latest_frame = None               # most recent BGR frame, kept fresh by the grabber
+        self._frame_lock = threading.Lock()
+        self._grab_started = False
 
     def mark_contact(self):
         with self._contact_lock:
@@ -69,9 +71,11 @@ class Shared:
         with self._contact_lock:
             return time.time() - self.last_contact_t
 
-    # --- Camera: open ONCE and keep it open. Re-opening per frame costs ~15-20s on a
-    #     Jetson Nano; reusing the handle makes each grab near-instant, so live mode is
-    #     smooth. Only the FIRST open pays the warm-up cost.
+    # --- Camera: a BACKGROUND grabber thread continuously reads the latest frame and keeps
+    #     the driver's buffer drained. Polling a USB camera slowly (one frame every few
+    #     seconds) otherwise fills its internal buffer and the NEXT read FREEZES — exactly
+    #     the "live works for a few frames then sticks" symptom. /frame just returns the most
+    #     recent grabbed frame, so the request path never blocks on (or stalls) the camera.
     def _open_cam(self):
         import cv2
         import platform
@@ -85,8 +89,10 @@ class Shared:
             return None
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        for _ in range(3):      # discard warm-up frames (only on open, NOT every grab)
-            cap.read()
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep the buffer tiny (driver permitting)
+        except Exception:
+            pass
         return cap
 
     def _release_cam(self):
@@ -97,29 +103,45 @@ class Shared:
                 pass
             self._cap = None
 
-    def capture_pil(self):
-        """One frame from the PERSISTENT handle. Returns a PIL.Image or None."""
-        import cv2
-        with self.cam_lock:
-            if self._cap is None or not self._cap.isOpened():
-                self._release_cam()
-                self._cap = self._open_cam()
-                if self._cap is None:
-                    return None
-            ok, frame = self._cap.read()
-            if not ok or frame is None:         # handle dropped -> reopen once
-                self._release_cam()
-                self._cap = self._open_cam()
-                if self._cap is None:
-                    return None
-                ok, frame = self._cap.read()
+    def start_camera(self):
+        """Start the background grabber thread (idempotent)."""
+        if self._grab_started:
+            return
+        self._grab_started = True
+        threading.Thread(target=self._grab_loop, name="cam-grabber", daemon=True).start()
+
+    def _grab_loop(self):
+        while True:
+            try:
+                if self._cap is None or not self._cap.isOpened():
+                    self._release_cam()
+                    self._cap = self._open_cam()
+                    if self._cap is None:
+                        time.sleep(2.0)              # no camera yet — keep retrying
+                        continue
+                ok, frame = self._cap.read()         # blocks ~1/fps, so the loop self-paces
                 if not ok or frame is None:
-                    return None
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(rgb)
+                    self._release_cam()
+                    time.sleep(0.5)
+                    continue
+                with self._frame_lock:
+                    self._latest_frame = frame
+            except Exception as e:
+                print(f"[worker] camera grabber error: {e}")
+                self._release_cam()
+                time.sleep(1.0)
+
+    def capture_pil(self):
+        """Most recent frame from the grabber. Returns a PIL.Image, or None if none yet."""
+        import cv2
+        with self._frame_lock:
+            frame = self._latest_frame.copy() if self._latest_frame is not None else None
+        if frame is None:
+            return None
+        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
     def capture_jpeg(self):
-        """Grab one frame and JPEG-encode it. Returns bytes, or None if no camera."""
+        """JPEG-encode the most recent frame. Returns bytes, or None if no frame yet."""
         img = self.capture_pil()
         if img is None:
             return None
@@ -312,14 +334,11 @@ def main():
     except Exception as e:
         print(f"[worker] model warm-up skipped ({e}); will load on first use.")
 
-    # Pre-open the camera so the FIRST /frame is fast — opening it costs ~15-20s on a Nano,
-    # and we don't want the dashboard's first live frame to stall on that.
-    try:
-        print("[worker] opening camera (one-time warm-up)…")
-        print("[worker] camera ready." if shared.capture_pil() is not None
-              else "[worker] camera not available yet — will open on demand.")
-    except Exception as e:
-        print(f"[worker] camera warm-up skipped ({e}).")
+    # Start the background camera grabber: it keeps the latest frame ready and the camera
+    # buffer drained, so slow polling can never freeze the feed. /frame returns the latest
+    # grabbed frame instantly. (Opening the camera ~15-20s on a Nano happens in this thread.)
+    shared.start_camera()
+    print("[worker] camera grabber started (serves the latest frame; camera opens in the background).")
 
     print(f"[worker] started · method={method} · interval={interval}s · poll={poll:.0f}s · "
           f"presence_timeout={presence_timeout:.0f}s · "
