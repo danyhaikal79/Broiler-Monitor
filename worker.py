@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "new_dashboard"))
 
+from PIL import Image  # noqa: E402
 from core import config, db, notify, inference, cv_feeder, sensor, video, engine  # noqa: E402
 
 
@@ -58,6 +59,7 @@ class Shared:
         self.last_contact_t = 0.0               # last time the dashboard pinged/fetched
         self.latest_env = (float(cfg.get("temperature_fallback_c", 25.0)),
                            float(cfg.get("humidity_fallback_pct", 70.0)))
+        self._cap = None                        # PERSISTENT camera handle (see capture_pil)
 
     def mark_contact(self):
         with self._contact_lock:
@@ -67,10 +69,58 @@ class Shared:
         with self._contact_lock:
             return time.time() - self.last_contact_t
 
+    # --- Camera: open ONCE and keep it open. Re-opening per frame costs ~15-20s on a
+    #     Jetson Nano; reusing the handle makes each grab near-instant, so live mode is
+    #     smooth. Only the FIRST open pays the warm-up cost.
+    def _open_cam(self):
+        import cv2
+        import platform
+        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(int(self.cfg.get("camera_index", 0)), backend)
+        if not cap.isOpened():
+            try:
+                cap.release()
+            except Exception:
+                pass
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        for _ in range(3):      # discard warm-up frames (only on open, NOT every grab)
+            cap.read()
+        return cap
+
+    def _release_cam(self):
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+
+    def capture_pil(self):
+        """One frame from the PERSISTENT handle. Returns a PIL.Image or None."""
+        import cv2
+        with self.cam_lock:
+            if self._cap is None or not self._cap.isOpened():
+                self._release_cam()
+                self._cap = self._open_cam()
+                if self._cap is None:
+                    return None
+            ok, frame = self._cap.read()
+            if not ok or frame is None:         # handle dropped -> reopen once
+                self._release_cam()
+                self._cap = self._open_cam()
+                if self._cap is None:
+                    return None
+                ok, frame = self._cap.read()
+                if not ok or frame is None:
+                    return None
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb)
+
     def capture_jpeg(self):
         """Grab one frame and JPEG-encode it. Returns bytes, or None if no camera."""
-        with self.cam_lock:
-            img = video.capture_frame(int(self.cfg.get("camera_index", 0)))
+        img = self.capture_pil()
         if img is None:
             return None
         buf = io.BytesIO()
@@ -137,9 +187,8 @@ def start_http_server(shared, port):
 # Capture + commit (autonomous; also used by Telegram /capture)
 # ----------------------------------------------------------------------------
 def autonomous_cycle(cfg, cv_bundle, method, shared, alert_state):
-    """Capture one frame, analyse, log + alert. Returns (row, coverage) or None."""
-    with shared.cam_lock:
-        img = video.capture_frame(int(cfg.get("camera_index", 0)))
+    """Capture one frame (persistent handle), analyse, log + alert. Returns (row, coverage) or None."""
+    img = shared.capture_pil()
     if img is None:
         print("[worker] no camera frame; skipping cycle")
         return None
@@ -262,6 +311,15 @@ def main():
         print("[worker] models ready.")
     except Exception as e:
         print(f"[worker] model warm-up skipped ({e}); will load on first use.")
+
+    # Pre-open the camera so the FIRST /frame is fast — opening it costs ~15-20s on a Nano,
+    # and we don't want the dashboard's first live frame to stall on that.
+    try:
+        print("[worker] opening camera (one-time warm-up)…")
+        print("[worker] camera ready." if shared.capture_pil() is not None
+              else "[worker] camera not available yet — will open on demand.")
+    except Exception as e:
+        print(f"[worker] camera warm-up skipped ({e}).")
 
     print(f"[worker] started · method={method} · interval={interval}s · poll={poll:.0f}s · "
           f"presence_timeout={presence_timeout:.0f}s · "
