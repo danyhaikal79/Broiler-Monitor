@@ -1,70 +1,51 @@
-# Deploying Broiler Monitor on the Jetson Nano (Docker)
+# Deploying Broiler Monitor — split: Jetson worker + laptop dashboard
 
-Goal: run the dashboard **on the Jetson** (with the USB webcam attached) so any
-PC on the same network can open it at `http://<jetson-ip>:8500`.
+**Topology (current design):**
+
+- **Jetson** runs **`worker.py` only** — it owns the USB camera + DHT-22, logs to the
+  database 24/7 when you're away, and serves a tiny HTTP API on **port 8077**
+  (`/frame`, `/ping`, `/health`).
+- **Laptop** runs the **dashboard** (Streamlit). It does its own YOLO + CV inference.
+  In **Live** mode it pulls frames from the Jetson over the LAN; in **Upload** mode it
+  analyzes files locally. While the dashboard is open the worker stands down and the
+  laptop does the logging.
+- Both are on the **same Wi-Fi/hotspot**. The laptop addresses the Jetson by its
+  **mDNS hostname** (e.g. `jetson00-desktop.local`), so a changing IP never matters.
 
 ---
 
-## ⚠️ Read this first — the version determines everything
+## ⚠️ Read this first — the Jetson version determines the base image
 
 The **original** Jetson Nano (2019) ships JetPack 4.x → Ubuntu 18.04 → Python 3.6,
-which is too old for modern Ultralytics. Docker solves this by running a container
-with Python 3.8 + PyTorch-CUDA inside. But the **base image tag depends on your
-exact L4T version**, so we find it first.
+too old for modern Ultralytics. Docker solves this with a Python-3.8 + PyTorch-CUDA
+container. The base image tag depends on your exact L4T version, so we find it first.
 
 ### Step 0 — find your JetPack / L4T version (run ON the Jetson)
 
 ```bash
 cat /etc/nv_tegra_release
-# Example output:  # R32 (release), REVISION: 7.1, ...   -> L4T r32.7.1  (JetPack 4.6.1)
-
-# or:
-sudo apt-cache show nvidia-jetpack 2>/dev/null | grep -m1 Version
+# Example:  # R32 (release), REVISION: 7.1, ...  -> L4T r32.7.1  (JetPack 4.6.1)
 ```
 
-**Tell me the L4T version** (e.g. `r32.7.1`) and I'll lock in the exact image tag.
-The rest of this guide uses `r32.7.1` as the example — replace it with yours.
+The rest uses `r32.7.1` as the example — replace it with yours.
 
 ---
 
-## Step 1 — install Docker + NVIDIA runtime (usually already on JetPack)
-
-JetPack normally ships Docker + the NVIDIA container runtime. Verify:
+## Step 1 — Docker + NVIDIA runtime (usually already on JetPack)
 
 ```bash
 docker --version
 sudo docker info | grep -i runtime        # should list 'nvidia'
+sudo usermod -aG docker $USER && newgrp docker   # run docker without sudo
 ```
-
-Add yourself to the docker group so you don't need sudo each time:
-
-```bash
-sudo usermod -aG docker $USER && newgrp docker
-```
-
----
 
 ## Step 2 — get an Ultralytics-on-Jetson base image
-
-The cleanest source is **dusty-nv's prebuilt containers**. For your L4T version,
-pull the matching ultralytics image, e.g.:
 
 ```bash
 docker pull dustynv/ultralytics:r32.7.1
 ```
 
-> If no prebuilt tag exists for your exact L4T, two fallbacks:
-> 1. Use `dusty-nv/jetson-containers` to build it (clone an older commit that still
->    supports r32 if you're on JetPack 4). Building on a 4GB Nano is slow — enable swap first (Step 5).
-> 2. Use the closest `l4t-pytorch` / `l4t-ml` base and `pip install ultralytics` inside.
->
-> Send me your version and I'll give the precise command.
-
----
-
-## Step 3 — add Streamlit (build the thin image)
-
-From the **project root** (`fyp3/`), build our image on top of the base:
+## Step 3 — build the thin image (from the project root `fyp3/`)
 
 ```bash
 docker build -f deploy/Dockerfile.jetson \
@@ -72,63 +53,88 @@ docker build -f deploy/Dockerfile.jetson \
     -t broiler-monitor:jetson .
 ```
 
-This just layers Streamlit on top — the project itself is **mounted at runtime**, not copied.
+The project is **mounted at runtime**, not copied — your models + config stay live.
 
 ---
 
-## Step 4 — run it
+## Step 4 — run the WORKER on the Jetson
+
+Put `monitor_config.json` next to the project (Supabase + Telegram creds, `camera_index`,
+`serial_port`, etc.). Then:
 
 ```bash
 bash deploy/run_jetson.sh
 ```
 
 This:
-- gives the container the GPU (`--runtime nvidia`)
-- passes the USB webcam (`--device /dev/video0` — change `CAM=/dev/video1` if needed)
-- mounts the project so models + `cv_config.json` are live
-- serves on port 8500 over the LAN
+- gives the container the GPU (`--runtime nvidia`) and `--network host`
+- passes the USB webcam (`CAM=/dev/video0`) and the ESP32/DHT-22 serial (`SERIAL=/dev/ttyUSB0`)
+- mounts the project and runs **`worker.py`** (no Streamlit on the Jetson)
 
-Then on another PC: open `http://<jetson-ip>:8500` (get the IP with `hostname -I`),
-log in (`admin/admin123` or `staff/staff123`), pick **Live camera → Capture now**.
+**Check it's up** — from the Jetson or any PC on the network, open:
+
+```
+http://jetson00-desktop.local:8077/health      # -> {"ok": true, "role": "worker", ...}
+```
+
+(Use your Jetson's hostname; `hostname` on the Jetson prints it.)
+
+### Auto-start on boot (optional)
+
+```bash
+sudo cp deploy/broiler-monitor.service /etc/systemd/system/   # EDIT the project path + devices inside first
+sudo systemctl daemon-reload
+sudo systemctl enable --now broiler-monitor
+journalctl -u broiler-monitor -f                              # live logs
+```
 
 ---
 
-## Step 5 — make 4GB survive (important)
+## Step 5 — run the DASHBOARD on your laptop
 
-Two YOLO models + Streamlit is tight on 4 GB. Before running:
+On the laptop, in the project, make sure `monitor_config.json` has:
+
+```json
+"worker_host": "jetson00-desktop.local",   // your Jetson's hostname
+"worker_http_port": 8077
+```
+
+(plus the same Supabase creds, so History/Alerts read the cloud DB). Then:
 
 ```bash
-# Add 4GB swap (one-time)
+python -m streamlit run new_dashboard/super_finalise_dashboard/app.py
+```
+
+Open `http://localhost:8501`, log in (`admin/admin123` or `staff/staff123`), and on the
+**Monitor** page choose **Upload file** or **Live camera**. The sidebar shows
+**● WORKER ONLINE** when it can reach the Jetson.
+
+> **All-in-one test (no Jetson):** set `worker_host` to `127.0.0.1`, run `worker.py`
+> and the dashboard on the same machine. The laptop's own webcam serves `/frame`.
+
+---
+
+## Step 6 — make 4 GB survive (worker is much lighter than before)
+
+Running **only** the worker (no Streamlit) on the Jetson frees a lot of RAM, but two
+YOLO models are still heavy on a 4 GB Nano. Recommended:
+
+```bash
+# 4 GB swap (one-time)
 sudo fallocate -l 4G /var/swapfile && sudo chmod 600 /var/swapfile
 sudo mkswap /var/swapfile && sudo swapon /var/swapfile
 echo '/var/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab
 
-# Run headless (no desktop GUI) to free RAM
-sudo systemctl set-default multi-user.target   # boots to console; revert with graphical.target
+# headless (no desktop GUI) to free RAM
+sudo systemctl set-default multi-user.target   # revert with graphical.target
 
-# Max performance / clocks
+# max clocks
 sudo nvpmodel -m 0 && sudo jetson_clocks
 ```
 
-Expect **~1–3 s per analysis** with the "Capture now" button. Avoid auto-capture
-on the Nano (re-runs both models on a timer → heat + RAM pressure). A **2GB Nano
-will likely run out of memory** — if that's what you have, tell me and we'll
-load the two models one-at-a-time or go the TensorRT-only route.
-
----
-
-## Step 6 (optional, later) — TensorRT speed-up
-
-No extra hardware — uses the Nano's built-in GPU. Build the engines **on the Nano**:
-
-```bash
-# inside the container, on the Jetson:
-yolo export model=feeder_train/runs/seg_compare/yolov8n/weights/best.pt format=engine half=True imgsz=640
-yolo export model=chicken_train/runs/chicken_compare/yolo11n/weights/best.pt format=engine half=True imgsz=640
-```
-
-Then point `inference.py` at the `.engine` files instead of `.pt`. Ask me and I'll
-wire that switch in. Do this **after** the PyTorch path works.
+The Nano's first model load is slow (~30–90 s) and per-frame inference is seconds — fine
+for **autonomous interval logging**, but for a responsive **Live** view keep the laptop
+open (it does the inference; the Jetson just sends frames).
 
 ---
 
@@ -136,8 +142,9 @@ wire that switch in. Do this **after** the PyTorch path works.
 
 | Symptom | Fix |
 |---|---|
-| `could not select device driver "nvidia"` | NVIDIA runtime not set as default. `sudo nano /etc/docker/daemon.json` → add `"default-runtime": "nvidia"`, then `sudo systemctl restart docker`. |
-| Camera not found in container | Check `ls /dev/video*` on the host; pass the right one via `CAM=/dev/videoN`. |
-| OOM / killed | Enable swap (Step 5), run headless, close the desktop. Consider loading one model at a time. |
-| Streamlit not reachable from other PC | Confirm `--server.address 0.0.0.0` (run script does this) and that you used the Jetson's LAN IP, not localhost. `--network host` is already set. |
-| pip can't find streamlit version | base Python may be old; tell me the version and I'll pin a compatible Streamlit. |
+| Dashboard shows **WORKER OFFLINE** | Is `worker.py` running on the Jetson? Same Wi-Fi? Open `http://<jetson-host>:8077/health` in a browser. Check `worker_host` in the laptop's config. |
+| `jetson00-desktop.local` won't resolve | mDNS issue. Confirm `avahi-daemon` runs on the Jetson; on Windows, Bonjour/mDNS must be available. As a quick test, try the Jetson's current IP. |
+| Live view "camera unavailable (503)" | Camera busy/unplugged on the Jetson. Check `ls /dev/video*`; set `CAM=/dev/videoN` in `run_jetson.sh`. |
+| `could not select device driver "nvidia"` | NVIDIA runtime not default. Add `"default-runtime": "nvidia"` to `/etc/docker/daemon.json`, `sudo systemctl restart docker`. |
+| OOM / killed on the Jetson | Enable swap + headless (Step 6). The worker alone is much lighter than worker+dashboard was. |
+| Worker logs even when dashboard is open | The dashboard's heartbeat isn't reaching the worker — check the browser can reach `:8077` (same network, no firewall blocking the port). |

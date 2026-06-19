@@ -1,12 +1,15 @@
 """
-Monitor view — a PURE VIEWER/CONTROLLER. It runs NO inference and never writes to
-the database. All YOLO/CV inference + DB writes happen in the worker process.
+Monitor view — in the split deployment the DASHBOARD does its own inference.
 
-- Live mode  : sets the worker's camera flag ON and displays what the worker
-               publishes (latest numbers + annotated frame), auto-refreshing.
-- Upload mode: sets the camera flag OFF (worker camera paused), hands the uploaded
-               image/video to the worker via core.control, and shows the worker's
-               analyzed + logged result when it comes back (a few seconds later).
+- Upload mode (default): you drop an image/clip; the dashboard runs YOLO + CV here
+  on the laptop, logs the reading to the DB, fires alerts, and shows the result.
+- Live mode: the dashboard pulls fresh frames from the WORKER on the Jetson
+  (core.worker_client, over the LAN by hostname), runs inference here, displays
+  them, and logs to the DB throttled to `interval_sec`.
+
+The worker only logs on its OWN when this dashboard is absent. While the dashboard
+is open it pings the worker (see app.py) so the worker stands down and the laptop
+is the brain.
 """
 
 from __future__ import annotations
@@ -16,13 +19,17 @@ import time
 
 import streamlit as st
 
-from . import theme, video, sensor, inference, config, control
+from . import theme, video, sensor, inference, config, cv_feeder, engine, worker_client
 
 
-def _render_worker_readout(cfg, reading, coverage, images, extras, *, info_caption=""):
-    """The full readout (the old layout): headline cards + Original/Feeder/Feed-mask/
-    Chickens image tabs + status panel + daily-coverage bar. Driven entirely by what
-    the WORKER published (numbers + the 4 images + extras) — the dashboard infers nothing."""
+def _alert_state():
+    """Per-session cooldown timers for the dashboard's alerts (mirrors the worker's)."""
+    return st.session_state.setdefault("fin_alert_state", {"last_low": 0.0, "last_heat": 0.0})
+
+
+def _render_readout(cfg, reading, coverage, images, extras, *, info_caption=""):
+    """The full readout: headline cards + Original/Feeder/Feed-mask/Chickens image
+    tabs + status panel + daily-coverage bar. `images` is a dict of PIL Images."""
     r = reading or {}
     ex = extras or {}
     imgs = images or {}
@@ -102,107 +109,74 @@ def _render_worker_readout(cfg, reading, coverage, images, extras, *, info_capti
             st.progress(frac, text=f"{int(frac*100)}% of today's {required:.2f} kg")
 
 
-def _render_worker_live(cfg, interval: int):
-    """Live mode = display what the worker published (it owns the camera + DB)."""
-    theme.section("live monitor · worker")
-    st.caption("The **worker** on this device owns the camera and logs to the database. It keeps "
-               "running even if you close this page. Switch to **Upload file** to pause its camera.")
+# ----------------------------------------------------------------------------
+# Live mode — pull frames from the worker, analyse here, log (throttled)
+# ----------------------------------------------------------------------------
+def _render_live(cfg, method, method_display, interval):
+    theme.section("live monitor · worker camera")
+    st.caption(f"Pulling live frames from the worker at **{cfg.get('worker_host')}** and analysing "
+               "them here on the laptop. The worker logs on its own only when this dashboard is closed.")
 
+    live_refresh = max(2, int(cfg.get("live_refresh_sec", 5) or 5))
     try:
         from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=4000, key="fin_worker_refresh")
+        st_autorefresh(interval=live_refresh * 1000, key="fin_live_refresh")
     except ImportError:
         st.caption("⚠️ pip install streamlit-autorefresh for the live view to refresh on its own.")
-    if st.button("🔄 Refresh", key="fin_worker_manual"):
+    if st.button("🔄 Refresh now", key="fin_live_manual"):
         st.rerun()
 
-    latest = control.read_latest()
-    if latest is None:
-        st.warning("⏳ No worker data yet. Make sure **worker.py** is running on this device — it's "
-                   "the process that captures + logs. It should publish a frame within a few seconds "
-                   "of entering live mode.")
+    # Manual environment override (demo / no DHT-22 on the Jetson). Default: use the
+    # sensor reading that travels with each frame.
+    st.sidebar.markdown("### 🌡️ Environment")
+    override = st.sidebar.checkbox("Override sensor (set manually)", value=False, key="fin_live_override",
+                                   help="Use your own temp/humidity/age instead of the Jetson's DHT-22 reading.")
+    ovr = None
+    if override:
+        ot = st.sidebar.number_input("Temperature (°C)", 0.0, 50.0, 25.0, 0.5, key="fin_live_t")
+        oh = st.sidebar.number_input("Humidity (% RH)", 0.0, 100.0, 70.0, 1.0, key="fin_live_h")
+        oa = st.sidebar.number_input("Chicken age (days)", 0, 70, int(config.chicken_age_days(cfg)), 1,
+                                     key="fin_live_a")
+        ovr = {"temp": float(ot), "hum": float(oh), "age": int(oa)}
+
+    img, meta = worker_client.fetch_frame(cfg)
+    if img is None:
+        st.warning(f"⏳ {meta}")
+        st.info("Make sure **worker.py** is running on the Jetson and you're on the same Wi-Fi. "
+                f"You can also open `{worker_client.base_url(cfg)}/health` in a browser to check it.")
         return
-    if not control.is_fresh(latest["age_s"], interval):
-        st.warning(f"⚠️ Worker data is stale ({latest['age_s']:.0f}s old; a new reading is expected "
-                   f"every ~{interval}s). The worker may have stopped, or its camera is "
-                   f"unavailable (busy/unplugged). Check worker.py on this device.")
+    env = ovr if ovr else meta   # on success, meta = {temp, hum, age} from the Jetson's sensor
 
-    wmethod = int(cfg.get("feeder_method", 1))
-    wlabel = inference.METHOD_LABELS.get(wmethod, inference.METHOD_LABELS[1])
-    _render_worker_readout(
-        cfg, latest.get("reading"), latest.get("coverage"),
-        latest.get("images"), latest.get("extras"),
-        info_caption=f"🎯 Worker feed method: **{wlabel}** (set in monitor_config.json) · "
-                     f"🕒 updated {latest['age_s']:.0f}s ago")
-
-
-def render(role: str | None = None, show_header: bool = True):
-    if show_header:
-        theme.header("BROILER MONITOR", "live feed & flock monitoring", role)
-
-    cfg = config.load()
-    interval = int(cfg.get("interval_sec", 30) or 30)
-
-    # ---- Feed-estimation method selector (applies to uploads; sent to the worker) ----
-    st.sidebar.markdown("### 🎯 Feed method")
-    method_label = st.sidebar.radio(
-        "Estimation method", list(inference.METHOD_LABELS.values()),
-        label_visibility="collapsed", key="fin_method",
-        help="Method 1 = whole-feeder ROI · Method 2 = open-area ROI · Method 3 = demo "
-             "(dummy farm). Applies to uploads; live mode uses the worker's feeder_method.")
-    method = next((m for m, lbl in inference.METHOD_LABELS.items() if lbl == method_label), 1)
-    if not inference.feeder_method_available(method):
-        st.sidebar.warning(f"⚠️ {inference.METHOD_LABELS[method]} model not available — using Method 1.")
-        method = 1
-    method_display = inference.METHOD_LABELS[method]
-
-    # ---- input source — the MODE controls the worker's camera. Defaults to the worker's
-    # CURRENT state so re-opening the dashboard never accidentally pauses a live worker.
-    ctrl = control.read_control()
-    st.sidebar.markdown("### 📥 Input source")
-    source = st.sidebar.radio(
-        "Input source", ["Upload file", "Live camera"],
-        index=(1 if ctrl.get("camera_enabled") else 0),
-        label_visibility="collapsed", key="fin_source")
-
-    want_live = (source == "Live camera")
-
-    # Live-mode manual environment override — set temp/humidity/age yourself instead of
-    # the worker's DHT-22 / fallback (handy for demos with no sensor). Defaults seed from
-    # the current on-disk override so re-opening the dashboard doesn't reset it.
-    cur_ovr = ctrl.get("env_override")
-    env_override = None
-    if want_live:
-        st.sidebar.markdown("### 🌡️ Environment")
-        if st.sidebar.checkbox("Override sensor (set manually)", value=(cur_ovr is not None),
-                               key="fin_live_override",
-                               help="Use your own temp/humidity/age instead of the worker's "
-                                    "DHT-22 / fallback. Useful with no sensor attached."):
-            ot = st.sidebar.number_input("Temperature (°C)", 0.0, 50.0,
-                                         float(cur_ovr.get("temp", 25.0)) if cur_ovr else 25.0, 0.5,
-                                         key="fin_ovr_t")
-            oh = st.sidebar.number_input("Humidity (% RH)", 0.0, 100.0,
-                                         float(cur_ovr.get("hum", 70.0)) if cur_ovr else 70.0, 1.0,
-                                         key="fin_ovr_h")
-            oa = st.sidebar.number_input("Chicken age (days)", 0, 60,
-                                         int(cur_ovr.get("age")) if cur_ovr else int(config.chicken_age_days(cfg)),
-                                         1, key="fin_ovr_a")
-            env_override = {"temp": float(ot), "hum": float(oh), "age": int(oa)}
-
-    # Tell the worker the desired state (camera flag + env override). Write only when it
-    # differs from what's on disk — so no churn, and it also reconciles another tab/process.
-    desired = {"camera_enabled": want_live, "env_override": env_override}
-    current = {"camera_enabled": bool(ctrl.get("camera_enabled")), "env_override": cur_ovr}
-    if desired != current:
-        control.set_control(want_live, env_override)
-
-    # ===================== LIVE: view the worker (it owns the camera + DB) =====================
-    if source == "Live camera":
-        _render_worker_live(cfg, interval)
+    cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
+    try:
+        row, coverage, images, extras = engine.analyze_image(
+            cfg, cv_bundle, img, method, env["temp"], env["hum"], env["age"])
+    except Exception as e:
+        st.error(f"⚠️ Inference failed: {e}")
         return
 
-    # ===================== UPLOAD: hand the file to the worker; show its result =================
-    # File uploader sits RIGHT UNDER the Input-source options; Environment goes below it.
+    # Throttle DB logging to interval_sec (we DISPLAY every refresh, but don't spam the DB).
+    now = time.time()
+    last_log = st.session_state.get("fin_live_last_log", 0.0)
+    if now - last_log >= interval:
+        try:
+            engine.commit_reading(cfg, row, coverage, source="live", alert_state=_alert_state())
+            st.session_state["fin_live_last_log"] = now
+            log_note = " · ✅ logged"
+        except Exception as e:
+            log_note = f" · ⚠️ log failed: {e}"
+    else:
+        log_note = f" · next log in ~{int(interval - (now - last_log))}s"
+
+    src = "manual override" if ovr else f"Jetson sensor {env['temp']:.0f}°C / {env['hum']:.0f}% RH"
+    _render_readout(cfg, row, coverage, images, extras,
+                    info_caption=f"🎯 {method_display} · 🛰️ live from worker · {src}{log_note}")
+
+
+# ----------------------------------------------------------------------------
+# Upload mode — analyse + log a file here on the laptop
+# ----------------------------------------------------------------------------
+def _render_upload(cfg, method, method_display, interval):
     st.sidebar.markdown("### 📤 File")
     uploaded = st.sidebar.file_uploader(
         "Image or video", type=["jpg", "jpeg", "png", "mp4", "avi", "mov", "mkv", "webm", "m4v"],
@@ -212,65 +186,83 @@ def render(role: str | None = None, show_header: bool = True):
         max_frames = st.sidebar.slider("Frames to analyze", 6, 40, 20, 2, key="fin_maxf")
     temp, hum, age = sensor.sidebar_env_inputs("fin")   # Environment section, below the uploader
 
-    st.info("🛈 **Upload mode** — the worker's camera is **paused**. The worker analyzes your file, "
-            "**logs it to the database**, and returns the result here (takes a few seconds). The "
-            "dashboard itself runs no inference.")
+    st.info("🛈 **Upload mode** — the dashboard analyses your file here, **logs it to the database**, "
+            "and shows the result. (The worker on the Jetson stays paused while this dashboard is open.)")
 
     if uploaded is None:
         st.markdown(
             "<div class='cc-card' style='text-align:center; padding:48px'>"
             "<div style='font-size:42px'>📡</div>"
             "<div class='cc-title' style='margin-top:8px'>Upload to analyze</div>"
-            "<div class='sub'>Drop an image or a video clip in the sidebar — the worker will "
-            "analyze + log it.</div></div>", unsafe_allow_html=True)
+            "<div class='sub'>Drop an image or a video clip in the sidebar — it will be "
+            "analyzed + logged.</div></div>", unsafe_allow_html=True)
         return
 
     data = uploaded.getvalue()
-    MAX_MB = 64
+    MAX_MB = 200
     if len(data) > MAX_MB * 1024 * 1024:
         st.error(f"File is {len(data) / 1024 / 1024:.0f} MB — please upload under {MAX_MB} MB.")
         return
     kind = "video" if video.is_video(uploaded.name) else "image"
 
-    # Request id = file content + method (+frame count) ONLY — NOT the live sensor env,
-    # so DHT-22 Live-mode drift can't churn the id and re-submit/re-log the same file.
-    req_id = (hashlib.md5(data).hexdigest()[:12] + f"_m{method}"
-              + (f"_f{max_frames}" if kind == "video" else ""))
-    if st.session_state.get("fin_upload_submitted") != req_id:
-        try:
-            control.submit_upload(req_id, kind, data, method=method, temp=float(temp),
-                                  hum=float(hum), age=int(age), max_frames=max_frames)
-            st.session_state["fin_upload_submitted"] = req_id   # mark only AFTER a successful write
-            st.session_state["fin_upload_wait_t0"] = None
-        except Exception as e:
-            st.error(f"⚠️ Couldn't hand the file to the worker (will retry): {e}")
-            return
+    # Re-ANALYSE when the file/method/frames OR the environment changes (so the readout
+    # always matches the current temp/hum/age), but LOG to the DB only ONCE per
+    # file+method+frames — env tweaks update the display without spamming the database.
+    file_sig = (hashlib.md5(data).hexdigest()[:12] + f"_m{method}"
+                + (f"_f{max_frames}" if kind == "video" else ""))
+    analyze_sig = file_sig + f"_t{float(temp):.1f}_h{float(hum):.0f}_a{int(age)}"
+    cache = st.session_state.get("fin_upload_cache")
+    if not cache or cache.get("sig") != analyze_sig:
+        cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
+        with st.spinner("Analyzing…"):
+            try:
+                row, coverage, images, extras = engine.analyze_upload(
+                    cfg, cv_bundle, data, kind, method, float(temp), float(hum), int(age), max_frames)
+            except Exception as e:
+                st.error(f"⚠️ Couldn't analyze this file: {e}")
+                return
+        if st.session_state.get("fin_upload_logged") != file_sig:
+            engine.commit_reading(cfg, row, coverage, source="upload", alert_state=_alert_state())
+            st.session_state["fin_upload_logged"] = file_sig
+        st.session_state["fin_upload_cache"] = {
+            "sig": analyze_sig, "row": row, "coverage": coverage, "images": images, "extras": extras}
 
-    res = control.read_upload_result()
-    if res is None or res.get("id") != req_id:
-        # waiting — poll, but time out so a missing/stopped worker doesn't hang the UI forever
-        t0 = st.session_state.get("fin_upload_wait_t0") or time.time()
-        st.session_state["fin_upload_wait_t0"] = t0
-        if time.time() - t0 > 120:
-            st.error("⚠️ No result after 120s — is **worker.py** running? (The first analysis on a "
-                     "Jetson loads the AI models and can take a minute.) Re-select the file to retry.")
-            return
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=2000, key="fin_upload_refresh")
-        except ImportError:
-            if st.button("🔄 Check for result", key="fin_upload_check"):
-                st.rerun()
-        st.info("⏳ Sent to the worker — analyzing + logging… (make sure **worker.py** is running).")
-        return
+    c = st.session_state["fin_upload_cache"]
+    theme.section("upload result · analyzed + logged")
+    peak = " · 🐔 peak-bird frame" if kind == "video" else ""
+    _render_readout(cfg, c["row"], c["coverage"], c["images"], c["extras"],
+                    info_caption=f"🎯 Analyzed via **{method_display}**{peak} · ✅ logged to the database")
 
-    if res.get("error"):
-        st.error(f"⚠️ The worker couldn't process this file: {res['error']}")
-        return
 
-    theme.section("upload result · analyzed + logged by the worker")
-    peak_note = " · 🐔 peak-bird frame" if kind == "video" else ""
-    _render_worker_readout(
-        cfg, res.get("reading"), res.get("coverage"), res.get("images"), res.get("extras"),
-        info_caption=f"🎯 Analyzed via **{method_display}**{peak_note} · "
-                     f"✅ logged to the database by the worker")
+# ----------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------
+def render(role: str | None = None, show_header: bool = True):
+    if show_header:
+        theme.header("BROILER MONITOR", "live feed & flock monitoring", role)
+
+    cfg = config.load()
+    interval = int(cfg.get("interval_sec", 600) or 600)
+
+    # ---- Feed-estimation method selector ----
+    st.sidebar.markdown("### 🎯 Feed method")
+    method_label = st.sidebar.radio(
+        "Estimation method", list(inference.METHOD_LABELS.values()),
+        label_visibility="collapsed", key="fin_method",
+        help="Method 1 = whole-feeder ROI · Method 2 = open-area ROI · Method 3 = demo (dummy farm).")
+    method = next((m for m, lbl in inference.METHOD_LABELS.items() if lbl == method_label), 1)
+    if not inference.feeder_method_available(method):
+        st.sidebar.warning(f"⚠️ {inference.METHOD_LABELS[method]} model not available — using Method 1.")
+        method = 1
+    method_display = inference.METHOD_LABELS[method]
+
+    # ---- input source ----
+    st.sidebar.markdown("### 📥 Input source")
+    source = st.sidebar.radio(
+        "Input source", ["Upload file", "Live camera"],
+        label_visibility="collapsed", key="fin_source")
+
+    if source == "Live camera":
+        _render_live(cfg, method, method_display, interval)
+    else:
+        _render_upload(cfg, method, method_display, interval)

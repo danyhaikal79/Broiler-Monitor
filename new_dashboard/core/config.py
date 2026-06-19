@@ -28,6 +28,14 @@ _DEFAULTS = {
     "supabase_url": "", "supabase_key": "",
     "telegram_bot_token": "", "telegram_chat_id": "",
     "camera_index": 0, "interval_sec": 600,
+    # --- split deployment: dashboard (laptop) <-> worker (Jetson) over the LAN ---
+    # The dashboard reaches the worker by its mDNS HOSTNAME (not its IP, which changes
+    # on a hotspot). The worker serves /frame + /ping on worker_http_port.
+    "worker_host": "jetson00-desktop.local",  # set to the Jetson's hostname (or 127.0.0.1 for an all-in-one test)
+    "worker_http_port": 8077,                 # worker's frame/heartbeat HTTP server
+    "presence_timeout_sec": 25,               # worker logs on its own if no dashboard ping within this many seconds
+    "dashboard_heartbeat_sec": 8,             # how often the (open) dashboard pings the worker, browser-side
+    "live_refresh_sec": 5,                    # live-mode frame fetch + display cadence on the dashboard
     "feeder_method": 1,  # 1 = whole feeder, 2 = open area, 3 = demo/dummy farm
     "display_tz_offset_hours": 8,    # store UTC, DISPLAY local; Malaysia (MYT) = +8
     "display_tz_label": "MYT",

@@ -29,6 +29,9 @@ monitor_config.json
 *.sqlite
 *.sqlite3
 
+# Local run/test logs
+*.log
+
 # Worker <-> dashboard runtime control/handoff files (regenerated at runtime)
 monitor_control.json
 monitor_latest.json

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Run the Broiler Monitor dashboard in a container on the Jetson.
+# Run the Broiler Monitor WORKER in a container on the Jetson (split deployment).
+# The dashboard runs separately on your laptop and connects to this worker over the LAN.
 #
-# - --runtime nvidia      : gives the container the Jetson GPU (for YOLO/TensorRT)
+# - --runtime nvidia      : gives the container the Jetson GPU (for YOLO)
 # - --device /dev/video0  : passes the USB webcam through to the container
+# - --device /dev/ttyUSB0 : passes the ESP32/DHT-22 serial through
 # - -v "$PROJECT":/app     : mounts the whole project (models + config + code)
-# - -p 8500:8500          : exposes the dashboard on the LAN
+# - --network host        : the worker's HTTP server (:8077) is reachable on the LAN
 #
-# Other PCs on the same network then open:  http://<jetson-ip>:8500
-# (find the Jetson IP with:  hostname -I )
+# From the LAPTOP dashboard, set worker_host = this Jetson's hostname (e.g.
+# jetson00-desktop.local). Sanity-check the worker from any PC on the network:
+#   http://<jetson-hostname>:8077/health
 #
 # Usage:
 #   bash deploy/run_jetson.sh                 # uses IMAGE below
@@ -35,9 +38,9 @@ DEV_FLAGS=""
 echo "[run] image   = $IMAGE"
 echo "[run] project = $PROJECT"
 echo "[run] devices =$DEV_FLAGS"
-echo "[run] open    http://$(hostname -I | awk '{print $1}'):8500  from another PC on this network"
+echo "[run] worker HTTP on :8077 — check from another PC:  http://$(hostname):8077/health"
 
-# Runs BOTH the worker (engine) + the dashboard (UI) via deploy/start_jetson.sh.
+# Runs the worker (engine + frame/heartbeat server) via deploy/start_jetson.sh.
 docker run --rm -it \
   --runtime nvidia \
   --network host \

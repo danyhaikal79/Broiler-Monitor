@@ -1,4 +1,6 @@
-# systemd unit: auto-start Broiler Monitor (worker + dashboard) on Jetson boot.
+# systemd unit: auto-start the Broiler Monitor WORKER on Jetson boot.
+# (Split deployment: the dashboard runs on the laptop, not here. This runs the worker
+#  — camera, YOLO+CV, DB logging, Telegram, and the :8077 frame/heartbeat server.)
 #
 # 1. EDIT the two paths/devices below to match your Jetson:
 #      - the -v project path  (where you put full_system3 on the Jetson)
@@ -12,7 +14,7 @@
 #    Stop:       sudo systemctl stop broiler-monitor   (disable = don't start on boot)
 
 [Unit]
-Description=Broiler Monitor (worker + dashboard) in Docker
+Description=Broiler Monitor worker (Jetson) in Docker
 After=docker.service network-online.target
 Requires=docker.service
 Wants=network-online.target

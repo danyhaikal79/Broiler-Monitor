@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
-# Runs INSIDE the container. Starts BOTH processes that full_system3 needs:
-#   1. worker.py  – the engine: camera capture, YOLO+CV, DB logging, Telegram alerts
-#   2. streamlit  – the dashboard UI (a pure viewer/controller)
-# They share /app, so the worker<->dashboard control/handoff files work.
-# Only the worker opens the camera; the dashboard just reads what it publishes.
+# Runs INSIDE the container on the JETSON. Split deployment: the Jetson runs ONLY
+# the worker (engine) — camera capture, YOLO+CV, DB logging, Telegram alerts, and a
+# tiny HTTP server (port 8077) that serves live frames + a presence heartbeat.
+#
+# The DASHBOARD runs on your LAPTOP (streamlit), not here. It reaches this worker by
+# the Jetson's hostname over the LAN. Only the worker opens the camera.
 set -u
 cd /app
 
 # Worker (engine): keep it alive — auto-restart if it ever crashes.
-( while true; do
-    echo "[start] worker.py starting…"
+echo "[start] worker.py starting (HTTP frame/heartbeat server on :8077)…"
+while true; do
     python3 worker.py || echo "[start] worker exited (code $?), restarting in 5s…"
     sleep 5
-  done ) &
-
-# Dashboard (UI) in the foreground. If it dies, the container exits and
-# Docker/systemd restarts the whole thing.
-echo "[start] dashboard on :8500 …"
-exec python3 -m streamlit run new_dashboard/super_finalise_dashboard/app.py \
-     --server.address 0.0.0.0 --server.port 8500
+done

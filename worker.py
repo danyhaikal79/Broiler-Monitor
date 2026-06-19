@@ -1,38 +1,43 @@
 """
-Background monitoring worker (runs on the Jetson, separate from the dashboard).
+Background monitoring worker — runs ON THE JETSON, separate from the dashboard.
 
-The worker is the ONLY place that does inference AND the ONLY thing that writes to
-the database. The dashboard is a pure viewer/controller: it sets a flag and hands
-over uploaded files; it never runs YOLO and never writes to the DB.
+Split deployment (laptop dashboard + Jetson worker, same Wi-Fi):
 
-Each poll (~every few seconds) the worker:
-  1. Processes any pending UPLOAD the dashboard handed over (image or video) —
-     runs YOLO + CV, logs one reading, and publishes the annotated result back.
-  2. In LIVE mode (control flag camera_enabled=True) captures a camera frame every
-     `interval_sec`, logs it, publishes it, and fires a low-feed Telegram alert
-     (with cooldown). In Upload mode the camera is PAUSED (but uploads still run).
+  • The worker owns the camera + DHT-22 sensor.
+  • It serves a tiny HTTP API on `worker_http_port` (stdlib, no extra deps):
+        GET /ping   -> "the dashboard is here" heartbeat
+        GET /frame  -> one fresh camera JPEG (+ X-Temp/X-Hum/X-Age headers)
+        GET /health -> status JSON
+  • PRESENCE RULE — the only time the worker does inference + writes the DB itself:
+        - dashboard ABSENT (no /ping or /frame within `presence_timeout_sec`):
+              the worker captures every `interval_sec`, runs YOLO + CV, logs the
+              reading, and fires the low-feed + heat Telegram alerts.  ← 24/7 fallback
+        - dashboard PRESENT (laptop open & pinging):
+              the worker STANDS DOWN — no inference, no DB writes. It only serves
+              /frame on request; the laptop dashboard does the inference + logging.
+  • Two-way Telegram (/status, /latest, /capture, /help) works in either state.
 
-Because the worker is its own process, it keeps logging after the dashboard/browser
-is closed, as long as live mode was last selected. Only ONE process may own the
-camera — don't run two workers.
+Only ONE process may own the camera — don't run two workers.
 
-Run:
+Run (on the Jetson):
   python3 worker.py
 """
 
 import io
+import json
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "new_dashboard"))
 
-from PIL import Image  # noqa: E402
-from core import config, db, notify, inference, cv_feeder, logic, video, sensor, control  # noqa: E402
+from core import config, db, notify, inference, cv_feeder, sensor, video, engine  # noqa: E402
 
 
 def _read_env(cfg):
-    """(temp, hum): from the DHT-22 if use_sensor, else config fallback."""
+    """(temp, hum): from the DHT-22 if use_sensor, else the config fallback."""
     if cfg.get("use_sensor"):
         reading, err = sensor.read_latest(cfg.get("serial_port", "/dev/ttyUSB0"),
                                           int(cfg.get("serial_baud", 115200)))
@@ -42,124 +47,145 @@ def _read_env(cfg):
     return float(cfg.get("temperature_fallback_c", 25.0)), float(cfg.get("humidity_fallback_pct", 70.0))
 
 
-def _analyze_image(cfg, cv_bundle, img, method, temp, hum, age):
-    """Core analysis of ONE PIL image -> (reading_row, coverage, images, extras).
-    `images` = the 4 readout views; `extras` = extra display numbers. Shared by live
-    capture and upload processing. Does NOT log or publish."""
-    feeder = inference.run_feeder(img, method=method)
-    chicken = inference.run_chicken(img)
-    ftype = feeder.feeder_type or cfg.get("feeder_type", "pan7kg")
-    cvm = cv_feeder.measure(img, cv_bundle, ftype,
-                            yolo_polygon=feeder.feeder_polygon, yolo_bbox=feeder.feeder_bbox)
-    fill = cvm.fill_ratio if cvm else 0.0
-    _ov = cfg.get("chicken_count_override")
-    count = _ov if _ov is not None else chicken.count
-    pred = logic.compute(temperature_c=temp, humidity_pct=hum, age_days=age, chicken_count=count,
-                         current_food_kg=cvm.current_food_kg if cvm else 0.0, feeder_type=ftype)
-    coverage = (100.0 * pred.current_food_kg / pred.flock_daily_required_kg
-                if pred.flock_daily_required_kg > 0 else 100.0)
-    row = {
-        "ts": db.now_iso(cfg.get("display_tz_offset_hours", 0)),
-        "feeder_type": ftype, "feed_kg": round(pred.current_food_kg, 3),
-        "fill_ratio": round(fill, 4), "chicken_count": int(count),
-        "temperature_c": round(temp, 1), "humidity_pct": round(hum, 1),
-        "thi_c": round(pred.thi_c, 2), "required_kg": round(pred.flock_daily_required_kg, 3),
-        "feed_to_add_kg": round(pred.feed_to_add_kg, 3), "coverage_pct": round(coverage, 1),
-    }
-    images = {
-        "original": img,
-        "feeder": feeder.annotated_image,
-        "feed_mask": (cvm.mask_image if cvm else None),
-        "chickens": chicken.annotated_image,
-    }
-    extras = {
-        "wet_bulb_c": round(pred.wet_bulb_c, 2),
-        "thi_stress_factor": round(pred.thi_stress_factor, 3),
-        "feeder_conf": round(feeder.feeder_type_conf, 3),
-        "chicken_conf": round(chicken.avg_confidence, 3),
-        "detected": feeder.feeder_type,   # None if no feeder detected
-    }
-    return row, coverage, images, extras
+# ----------------------------------------------------------------------------
+# Shared state between the main loop and the HTTP server threads
+# ----------------------------------------------------------------------------
+class Shared:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.cam_lock = threading.Lock()        # serialise camera access (loop vs /frame)
+        self._contact_lock = threading.Lock()
+        self.last_contact_t = 0.0               # last time the dashboard pinged/fetched
+        self.latest_env = (float(cfg.get("temperature_fallback_c", 25.0)),
+                           float(cfg.get("humidity_fallback_pct", 70.0)))
+
+    def mark_contact(self):
+        with self._contact_lock:
+            self.last_contact_t = time.time()
+
+    def seconds_since_contact(self):
+        with self._contact_lock:
+            return time.time() - self.last_contact_t
+
+    def capture_jpeg(self):
+        """Grab one frame and JPEG-encode it. Returns bytes, or None if no camera."""
+        with self.cam_lock:
+            img = video.capture_frame(int(self.cfg.get("camera_index", 0)))
+        if img is None:
+            return None
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
 
 
-def _low_feed_msg(row, coverage, tag=""):
-    head = "⚠️ <b>Feed low</b>" + (f" ({tag})" if tag else "")
-    return (f"{head}\n"
-            f"Feeder: {row['feeder_type']}\n"
-            f"Current: {row['feed_kg']} kg ({coverage:.0f}% of today's need)\n"
-            f"Add ~{row['feed_to_add_kg']} kg.\n"
-            f"Birds: {row['chicken_count']} · THI: {row['thi_c']}°C")
+# ----------------------------------------------------------------------------
+# HTTP server: /ping (heartbeat), /frame (live image), /health
+# ----------------------------------------------------------------------------
+def _make_handler(shared):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass   # silence per-request console logging
+
+        def _send_json(self, obj, status=200):
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            shared.mark_contact()   # ANY request from the dashboard counts as presence
+            if path == "/ping":
+                self._send_json({"ok": True, "role": "worker"})
+            elif path == "/health":
+                self._send_json({"ok": True, "role": "worker",
+                                 "since_contact_s": round(shared.seconds_since_contact(), 1)})
+            elif path == "/frame":
+                jpg = shared.capture_jpeg()
+                if jpg is None:
+                    self._send_json({"error": "camera unavailable"}, status=503)
+                    return
+                t, h = shared.latest_env
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(jpg)))
+                self.send_header("X-Temp", str(round(float(t), 1)))
+                self.send_header("X-Hum", str(round(float(h), 1)))
+                self.send_header("X-Age", str(int(config.chicken_age_days(shared.cfg))))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(jpg)
+            else:
+                self._send_json({"error": "not found"}, status=404)
+
+    return Handler
 
 
-def _heat_msg(row, threshold):
-    return ("🔥 <b>HEAT EMERGENCY</b>\n"
-            f"Temperature {row['temperature_c']}°C ≥ {threshold:.0f}°C — chickens are too hot "
-            "(survival zone).\n"
-            "Cool the house NOW: fans, water, ventilation.\n"
-            f"THI {row['thi_c']}°C · RH {row['humidity_pct']}%")
+def start_http_server(shared, port):
+    httpd = ThreadingHTTPServer(("0.0.0.0", int(port)), _make_handler(shared))
+    t = threading.Thread(target=httpd.serve_forever, name="worker-http", daemon=True)
+    t.start()
+    return httpd
 
 
-def _status_msg(row, coverage, age_s=None):
-    """Current-status reply (same style as the alerts)."""
-    age = f"  ·  {int(age_s)}s ago" if age_s is not None else ""
-    return ("📊 <b>Current status</b>" + age + "\n"
-            f"Feeder: {row.get('feeder_type')}\n"
-            f"Feed: {row.get('feed_kg')} kg ({float(coverage or 0):.0f}% of today's need)\n"
-            f"Add: {row.get('feed_to_add_kg')} kg\n"
-            f"Birds: {row.get('chicken_count')}\n"
-            f"Temp {row.get('temperature_c')}°C · RH {row.get('humidity_pct')}% · "
-            f"THI {row.get('thi_c')}°C")
-
-
-def analyze_once(cfg, cv_bundle, method):
-    """Capture one camera frame, analyze, log, and publish for the live view."""
-    img = video.capture_frame(int(cfg["camera_index"]))
+# ----------------------------------------------------------------------------
+# Capture + commit (autonomous; also used by Telegram /capture)
+# ----------------------------------------------------------------------------
+def autonomous_cycle(cfg, cv_bundle, method, shared, alert_state):
+    """Capture one frame, analyse, log + alert. Returns (row, coverage) or None."""
+    with shared.cam_lock:
+        img = video.capture_frame(int(cfg.get("camera_index", 0)))
     if img is None:
         print("[worker] no camera frame; skipping cycle")
         return None
-    ovr = control.read_control().get("env_override")
-    if ovr:   # dashboard manual override (Live mode, no-sensor demo)
-        temp = float(ovr.get("temp", cfg.get("temperature_fallback_c", 25.0)))
-        hum = float(ovr.get("hum", cfg.get("humidity_fallback_pct", 70.0)))
-        age = int(ovr.get("age", config.chicken_age_days(cfg)))
-    else:
-        temp, hum = _read_env(cfg)
-        age = config.chicken_age_days(cfg)
-    row, coverage, images, extras = _analyze_image(cfg, cv_bundle, img, method, temp, hum, age)
-    synced = db.log_reading(cfg, row)
-    control.write_latest(row, coverage, images=images, extras=extras)
-    print(f"[worker] feed={row['feed_kg']}kg cover={coverage:.0f}% "
+    temp, hum = _read_env(cfg)
+    shared.latest_env = (temp, hum)
+    age = config.chicken_age_days(cfg)
+    row, coverage, _imgs, _ex = engine.analyze_image(cfg, cv_bundle, img, method, temp, hum, age)
+    synced = engine.commit_reading(cfg, row, coverage, source="worker", alert_state=alert_state)
+    print(f"[worker] (auto) feed={row['feed_kg']}kg cover={coverage:.0f}% "
           f"birds={row['chicken_count']} THI={row['thi_c']} cloud={'ok' if synced else 'local-only'}")
     return row, coverage
 
 
 # ----------------------------------------------------------------------------
-# Two-way Telegram: respond to /status, /current, /latest, /capture, /help
+# Two-way Telegram: /status, /current, /latest, /capture, /help
 # ----------------------------------------------------------------------------
 def _send(cfg, text):
     notify.send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
 
 
+def _latest_from_db(cfg):
+    """Most recent reading from the DB (logged by whichever side was active)."""
+    rows = db.fetch_readings(cfg, limit=1)
+    return rows[0] if rows else None
+
+
 def _reply_latest(cfg):
-    latest = control.read_latest()
-    if latest and latest.get("reading"):
-        _send(cfg, _status_msg(latest["reading"], latest.get("coverage"), age_s=latest.get("age_s")))
+    row = _latest_from_db(cfg)
+    if row:
+        _send(cfg, engine.status_msg(row, row.get("coverage_pct")))
     else:
-        _send(cfg, "No saved reading yet — start live monitoring or send /capture.")
+        _send(cfg, "No readings yet — send /capture to grab one now.")
 
 
-def _reply_capture(cfg, cv_bundle, method):
-    _send(cfg, "📸 Capturing a fresh frame…")
-    result = analyze_once(cfg, cv_bundle, method)   # one-off capture; logs + publishes
+def _reply_capture(cfg, cv_bundle, method, shared, alert_state):
+    _send(cfg, "\U0001f4f8 Capturing a fresh frame…")
+    result = autonomous_cycle(cfg, cv_bundle, method, shared, alert_state)
     if result:
         row, coverage = result
-        _send(cfg, _status_msg(row, coverage))
+        _send(cfg, engine.status_msg(row, coverage))
     else:
         _send(cfg, "⚠️ Couldn't capture — camera unavailable (busy/unplugged).")
 
 
-def handle_telegram_commands(cfg, cv_bundle, method, offset):
-    """Poll for commands and reply. Only the configured chat_id is honored.
+def handle_telegram_commands(cfg, cv_bundle, method, offset, shared, alert_state):
+    """Poll for commands and reply. Only the configured chat_id is honoured.
     Returns the new offset (last processed update_id + 1)."""
     if not config.is_telegram_configured(cfg):
         return offset
@@ -168,6 +194,7 @@ def handle_telegram_commands(cfg, cv_bundle, method, offset):
     updates, ok = notify.get_updates(token, offset=offset)
     if not ok:
         return offset
+    present_timeout = float(cfg.get("presence_timeout_sec", 25))
     for u in updates:
         offset = u["update_id"] + 1
         msg = u.get("message") or u.get("edited_message") or {}
@@ -177,75 +204,30 @@ def handle_telegram_commands(cfg, cv_bundle, method, offset):
             continue   # ignore other chats / non-commands (security)
         cmd = text.split()[0].split("@")[0]   # "/current status" -> "/current"; strip @botname
         if cmd in ("/status", "/current"):
-            if control.read_control().get("camera_enabled"):
-                latest = control.read_latest()
-                if latest and latest.get("reading"):
-                    _send(cfg, _status_msg(latest["reading"], latest.get("coverage"), age_s=latest.get("age_s")))
-                else:
-                    _reply_capture(cfg, cv_bundle, method)
+            # Read-only: NEVER capture/log here (that would violate stand-down while the
+            # dashboard is present). Use /capture to force a fresh frame.
+            row = _latest_from_db(cfg)
+            if row:
+                where = "dashboard is live" if shared.seconds_since_contact() < present_timeout else "worker logging"
+                _send(cfg, engine.status_msg(row, row.get("coverage_pct")) + f"\n<i>({where})</i>")
             else:
-                _send(cfg, "🔸 <b>Monitoring is paused</b> (Upload mode).\n"
-                           "Send <b>/latest</b> for the last saved reading, or "
-                           "<b>/capture</b> to grab a fresh frame now.")
+                _send(cfg, "No readings yet — send /capture to grab one now.")
         elif cmd == "/latest":
             _reply_latest(cfg)
         elif cmd == "/capture":
-            _reply_capture(cfg, cv_bundle, method)
+            _reply_capture(cfg, cv_bundle, method, shared, alert_state)
         elif cmd in ("/help", "/start"):
-            _send(cfg, "🐔 <b>Broiler Monitor</b> commands:\n"
-                       "/status – current data (live) or options (if paused)\n"
+            _send(cfg, "\U0001f414 <b>Broiler Monitor</b> commands:\n"
+                       "/status – latest reading (live or worker-logged)\n"
                        "/latest – last saved reading\n"
                        "/capture – grab a fresh frame now")
         print(f"[worker] telegram cmd: {cmd}")
     return offset
 
 
-def process_upload(cfg, req):
-    """Analyze + log an image/video the dashboard handed over, then publish the
-    result (correlated by req id). For video, logs the peak-bird frame."""
-    rid = req.get("id", "?")
-    try:
-        method = int(req.get("method", cfg.get("feeder_method", 1)))
-        if method == 2 and not inference.feeder_method_available(2):
-            method = 1
-        cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
-        temp = float(req.get("temp", cfg.get("temperature_fallback_c", 25.0)))
-        hum = float(req.get("hum", cfg.get("humidity_fallback_pct", 70.0)))
-        age = int(req.get("age", config.chicken_age_days(cfg)))
-        data = req["data_bytes"]
-
-        if req.get("kind") == "video":
-            frames = video.sample_frames(data, max_frames=int(req.get("max_frames", 20)))
-            if not frames:
-                control.write_upload_result(rid, None, 0.0, error="could not read video frames")
-                return
-            best = None   # pick the peak-bird frame (best flock-size estimate)
-            for _ts, fr in frames:
-                r, cov, imgs, ex = _analyze_image(cfg, cv_bundle, fr, method, temp, hum, age)
-                if best is None or r["chicken_count"] > best[0]["chicken_count"]:
-                    best = (r, cov, imgs, ex)
-            row, coverage, images, extras = best
-        else:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-            row, coverage, images, extras = _analyze_image(cfg, cv_bundle, img, method, temp, hum, age)
-
-        db.log_reading(cfg, row)
-        if coverage < float(cfg.get("low_feed_coverage_pct", 25)) and row["chicken_count"] > 0:
-            if config.is_telegram_configured(cfg):
-                notify.send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"],
-                                     _low_feed_msg(row, coverage, "manual upload"))
-            db.log_alert(cfg, "low_feed",
-                         f"(upload) coverage {coverage:.0f}% · add {row['feed_to_add_kg']}kg", value=coverage)
-        control.write_upload_result(rid, row, coverage, images=images, extras=extras)
-        print(f"[worker] processed upload {rid[:8]} · feed={row['feed_kg']}kg cover={coverage:.0f}%")
-    except Exception as e:
-        print(f"[worker] upload {rid[:8]} failed: {e}")
-        try:
-            control.write_upload_result(rid, None, 0.0, error=str(e))
-        except Exception:
-            pass
-
-
+# ----------------------------------------------------------------------------
+# Main loop
+# ----------------------------------------------------------------------------
 def main():
     cfg = config.load()
     method = int(cfg.get("feeder_method", 1))
@@ -255,14 +237,24 @@ def main():
         cfg["feeder_method"] = 1
     cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
     interval = int(cfg.get("interval_sec", 600))
-    low_thr = float(cfg.get("low_feed_coverage_pct", 25))
-    cooldown = float(cfg.get("alert_cooldown_min", 60)) * 60
-    high_temp = float(cfg.get("high_temp_alert_c", 38))
-    poll = max(1.0, min(5.0, float(interval)))   # control-flag + upload-inbox check cadence
+    presence_timeout = float(cfg.get("presence_timeout_sec", 25))
+    port = int(cfg.get("worker_http_port", 8077))
+    poll = max(1.0, min(5.0, float(interval)))   # loop cadence (presence + telegram check)
 
-    # Pre-warm the YOLO models so the FIRST capture/upload isn't a slow cold-load.
-    # On a Jetson Nano this one-time load is ~30-90s; doing it now (at boot) keeps the
-    # first user action responsive instead of timing out.
+    # Start the HTTP server FIRST so /frame works immediately — it only needs the camera,
+    # not the YOLO models. (Important on the Jetson: model warm-up below is ~30-90s, and we
+    # don't want live frames blocked behind it.)
+    shared = Shared(cfg)
+    try:
+        start_http_server(shared, port)
+        print(f"[worker] HTTP frame/heartbeat server on :{port}  (/ping  /frame  /health)")
+    except Exception as e:
+        print(f"[worker] !! could not start HTTP server on :{port}: {e}")
+        print("[worker] continuing as a standalone autonomous logger (no live streaming to a dashboard).")
+
+    # Pre-warm the YOLO models so the first AUTONOMOUS capture isn't a slow cold-load.
+    # On a Jetson Nano this one-time load is ~30-90s; the frame server above is already
+    # serving while this runs. (The dashboard does its own model loading on the laptop.)
     try:
         print("[worker] loading models (one-time warm-up, can take ~30-90s on Jetson)…")
         inference.load_feeder_model(method)
@@ -272,15 +264,14 @@ def main():
         print(f"[worker] model warm-up skipped ({e}); will load on first use.")
 
     print(f"[worker] started · method={method} · interval={interval}s · poll={poll:.0f}s · "
-          f"low-feed<{low_thr}% · supabase={'on' if config.is_supabase_configured(cfg) else 'OFF'} · "
+          f"presence_timeout={presence_timeout:.0f}s · "
+          f"supabase={'on' if config.is_supabase_configured(cfg) else 'OFF'} · "
           f"telegram={'on' if config.is_telegram_configured(cfg) else 'OFF'}")
-    print("[worker] live mode = capture; upload mode = camera paused (uploads still processed). Waiting…")
+    print("[worker] dashboard ABSENT -> I capture + log; dashboard PRESENT -> I stand down (it logs). Waiting…")
 
-    last_alert_t = 0.0
-    last_heat_alert_t = 0.0
-    last_capture_t = -1e9    # so the first enabled tick captures immediately
-    last_enabled = None      # to log state changes only
-    last_upload_id = None    # so each handed-over upload is processed once
+    alert_state = {"last_low": 0.0, "last_heat": 0.0}
+    last_capture_t = -1e9    # so the first autonomous tick captures immediately
+    last_present = None      # log state changes only
     # Drain any Telegram backlog so we don't reply to stale commands on restart.
     tg_offset = None
     if config.is_telegram_configured(cfg):
@@ -292,9 +283,11 @@ def main():
     while True:
         try:
             # Hot-reload lightweight config (interval/thresholds/method) without restart;
-            # keep YOLO/CV model loads OFF the hot path.
+            # keep YOLO/CV model loads OFF the hot path. Refresh the cached sensor reading
+            # here too (so /frame carries a recent temp/hum without blocking every poll).
             if poll_count % reload_every == 0:
                 cfg = config.load()
+                shared.cfg = cfg
                 new_method = int(cfg.get("feeder_method", 1))
                 if not inference.feeder_method_available(new_method):
                     new_method = 1
@@ -303,53 +296,29 @@ def main():
                     method = new_method
                     cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
                 interval = int(cfg.get("interval_sec", 600))
-                low_thr = float(cfg.get("low_feed_coverage_pct", 25))
-                cooldown = float(cfg.get("alert_cooldown_min", 60)) * 60
-                high_temp = float(cfg.get("high_temp_alert_c", 38))
+                presence_timeout = float(cfg.get("presence_timeout_sec", 25))
+                shared.latest_env = _read_env(cfg)
             poll_count += 1
 
-            # 1) Pending upload handed over by the dashboard (runs in ANY mode).
-            req = control.read_upload_request()
-            if req and req.get("id") and req["id"] != last_upload_id:
-                last_upload_id = req["id"]
-                process_upload(cfg, req)
-                control.consume_upload_request()   # so a worker restart won't re-run it
+            # Answer Telegram commands in any state.
+            tg_offset = handle_telegram_commands(cfg, cv_bundle, method, tg_offset, shared, alert_state)
 
-            # 1b) Answer Telegram commands (/status, /latest, /capture) in any mode.
-            tg_offset = handle_telegram_commands(cfg, cv_bundle, method, tg_offset)
+            # Presence: if the dashboard is here, stand down (it does the logging).
+            present = shared.seconds_since_contact() < presence_timeout
+            if present != last_present:
+                print("[worker] dashboard " + ("PRESENT — standing down (dashboard logs)."
+                                               if present else "ABSENT — I am now logging."))
+                last_present = present
 
-            # 2) Live capture when enabled and it's time.
-            enabled = control.read_control().get("camera_enabled", False)
-            if enabled != last_enabled:
-                print(f"[worker] camera {'ENABLED (live mode)' if enabled else 'PAUSED (upload mode)'}")
-                last_enabled = enabled
             now = time.time()
-            if enabled and (now - last_capture_t) >= interval:
+            if (not present) and (now - last_capture_t) >= interval:
                 result = None
                 try:
-                    result = analyze_once(cfg, cv_bundle, method)
+                    result = autonomous_cycle(cfg, cv_bundle, method, shared, alert_state)
                 except Exception as e:
                     print(f"[worker] capture/analyze failed: {e}")
                 if result:
                     last_capture_t = now     # advance the timer only on a SUCCESSFUL capture
-                    row, coverage = result
-                    if coverage < low_thr and row["chicken_count"] > 0 and now - last_alert_t >= cooldown:
-                        if config.is_telegram_configured(cfg):
-                            ok, info = notify.send_telegram(
-                                cfg["telegram_bot_token"], cfg["telegram_chat_id"], _low_feed_msg(row, coverage))
-                            print(f"[worker] ALERT sent: {ok} ({info})")
-                        db.log_alert(cfg, "low_feed",
-                                     f"coverage {coverage:.0f}% · add {row['feed_to_add_kg']}kg", value=coverage)
-                        last_alert_t = now   # arm cooldown on LOG (no DB spam), Telegram configured or not
-                    if row["temperature_c"] >= high_temp and now - last_heat_alert_t >= cooldown:
-                        if config.is_telegram_configured(cfg):
-                            ok, info = notify.send_telegram(
-                                cfg["telegram_bot_token"], cfg["telegram_chat_id"], _heat_msg(row, high_temp))
-                            print(f"[worker] HEAT ALERT sent: {ok} ({info})")
-                        db.log_alert(cfg, "high_temp",
-                                     f"temp {row['temperature_c']}°C ≥ {high_temp:.0f}°C — heat emergency",
-                                     value=row["temperature_c"])
-                        last_heat_alert_t = now
                 else:
                     # transient capture/analyze failure: retry in ~max(poll,30)s, not a full interval
                     last_capture_t = now - max(0.0, interval - max(poll, 30.0))

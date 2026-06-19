@@ -62,9 +62,9 @@ FEEDER_TYPES = {"pan3kg", "pan7kg", "tube7kg"}
 _feeder_models = {}   # method (1|2) -> loaded YOLO model (cached)
 _chicken_model = None
 
-# Serialize YOLO inference: the background live monitor (monitor.py) runs predict
-# in a thread while the dashboard may also predict on the main thread. Ultralytics
-# models are not safe for concurrent predict on the same object, so guard both.
+# Serialize YOLO inference: the dashboard may run predict from concurrent Streamlit
+# sessions/reruns on the same cached model object, and Ultralytics models aren't safe
+# for concurrent predict on one object — so guard it. (The worker infers single-threaded.)
 _PREDICT_LOCK = threading.Lock()
 
 

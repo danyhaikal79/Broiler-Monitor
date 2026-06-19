@@ -10,6 +10,13 @@
   "camera_index": 0,
   "interval_sec": 600,
 
+  "_split_deploy_comment": "Dashboard (laptop) reaches the worker (Jetson) by HOSTNAME, not IP. On the LAPTOP set worker_host to the Jetson's mDNS name; for an all-in-one PC test use 127.0.0.1.",
+  "worker_host": "jetson00-desktop.local",
+  "worker_http_port": 8077,
+  "presence_timeout_sec": 25,
+  "dashboard_heartbeat_sec": 8,
+  "live_refresh_sec": 5,
+
   "_feeder_method_comment": "1 = whole feeder, 2 = open area, 3 = demo/dummy farm (uses Method 2's model until a Method-3 model is trained)",
   "feeder_method": 1,
 

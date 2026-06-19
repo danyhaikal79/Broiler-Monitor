@@ -1,4 +1,13 @@
 """
+DEPRECATED (kept for reference) — the single-device, same-machine IPC.
+
+This file-based control channel was used when the dashboard and worker ran on the
+SAME machine. The current split deployment (laptop dashboard + Jetson worker on the
+same LAN) coordinates over HTTP instead — see core/worker_client.py (dashboard side)
+and the HTTP server in worker.py (Jetson side). Nothing imports this module anymore;
+it is left here only as a record of the old design.
+
+----------------------------------------------------------------------------
 Worker control channel — local files shared between the dashboard and the worker.
 
 The dashboard and worker.py are SEPARATE processes on the same device (Jetson).

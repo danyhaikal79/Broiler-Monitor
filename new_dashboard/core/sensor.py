@@ -12,7 +12,8 @@ import json
 import threading
 import time
 
-import streamlit as st
+# NOTE: streamlit is imported LAZILY inside sidebar_env_inputs() only. The worker
+# (Jetson) imports this module for read_latest() and must NOT require streamlit.
 
 
 def list_ports() -> list[str]:
@@ -129,6 +130,8 @@ def sidebar_env_inputs(prefix: str):
       (YOLO is cached by image, so the refresh is cheap — models don't re-run.)
     - Live mode OFF: a 'Read once' button + manual editable inputs (demos / no sensor).
     """
+    import streamlit as st   # lazy: keeps the Jetson worker free of a streamlit dependency
+
     tkey, hkey = f"{prefix}_temp", f"{prefix}_hum"
     okkey = f"{prefix}_sensor_ok"
     st.session_state.setdefault(tkey, 25.0)

@@ -15,10 +15,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # add new_dashboard/ to path
 
 import streamlit as st
-from core import theme, auth, finalise_view, calibrate_view, history_view, alerts_view, control, config
+import streamlit.components.v1 as components
+from core import theme, auth, finalise_view, calibrate_view, history_view, alerts_view, worker_client, config
 
 st.set_page_config(page_title="Broiler Monitor · Secure", page_icon="🐔", layout="wide")
 theme.inject_css()
+
+
+@st.cache_data(ttl=6, show_spinner=False)
+def _worker_online(url: str) -> bool:
+    """Cached so we ping the worker for the badge at most once every 6s (not per rerun)."""
+    return worker_client.ping_url(url)
 
 # ---- gate ----
 if not auth.is_logged_in():
@@ -49,31 +56,46 @@ if st.sidebar.button("⎋ Sign out", use_container_width=True):
 
 st.sidebar.markdown("---")
 
-# ---- worker state indicator (visible on EVERY page) ----
-# Reflects the control flag the Monitor page sets + how fresh the worker's last
-# publish is. The WORKER (separate process) is what logs; this is just a status hint.
-_ctrl = control.read_control()
-if _ctrl.get("camera_enabled"):
-    _latest = control.read_latest()
-    _interval = int(config.load().get("interval_sec", 30) or 30)
-    _fresh = _latest is not None and control.is_fresh(_latest["age_s"], _interval)
-    _color = "#a3e635" if _fresh else "#fbbf24"
-    _sub = (f"updated {_latest['age_s']:.0f}s ago" if _latest else "waiting for worker…")
-    if _latest is not None and not _fresh:
-        _sub = f"stale ({_latest['age_s']:.0f}s) — worker running?"
+# ---- worker connectivity indicator + presence heartbeat (visible on EVERY page) ----
+# Split deployment: the worker runs on the Jetson. We (a) show whether it's reachable
+# over the LAN, and (b) keep pinging it from the BROWSER so it knows the dashboard is
+# open and stands down (lets the laptop do the inference + logging). The browser ping
+# is fire-and-forget JS — no Streamlit rerun, so History/Alerts pages don't flicker.
+_cfg = config.load()
+_wurl = worker_client.base_url(_cfg)
+_host = _cfg.get("worker_host", "?")
+_online = _worker_online(_wurl)
+if _online:
     st.sidebar.markdown(
-        f"<div style='padding:8px 10px;border:1px solid {_color};border-radius:8px;"
+        f"<div style='padding:8px 10px;border:1px solid #a3e635;border-radius:8px;"
         f"background:rgba(163,230,53,0.06);font-family:JetBrains Mono;font-size:0.74rem;"
         f"margin-bottom:10px'>"
-        f"<span style='color:{_color}'>● WORKER LIVE</span><br>"
-        f"<span style='color:#7d8896'>{_sub}</span></div>",
+        f"<span style='color:#a3e635'>● WORKER ONLINE</span><br>"
+        f"<span style='color:#7d8896'>{_host}</span></div>",
         unsafe_allow_html=True)
 else:
     st.sidebar.markdown(
-        "<div style='padding:8px 10px;border:1px solid #26303c;border-radius:8px;"
-        "font-family:JetBrains Mono;font-size:0.74rem;margin-bottom:10px;color:#7d8896'>"
-        "○ WORKER PAUSED<br><span>upload mode</span></div>",
+        f"<div style='padding:8px 10px;border:1px solid #26303c;border-radius:8px;"
+        f"font-family:JetBrains Mono;font-size:0.74rem;margin-bottom:10px;color:#7d8896'>"
+        f"○ WORKER OFFLINE<br><span>{_host} unreachable</span></div>",
         unsafe_allow_html=True)
+
+# Browser-side heartbeat: ping the worker every `dashboard_heartbeat_sec`. `no-cors`
+# is fire-and-forget (the worker still receives it; we don't need to read the reply),
+# so no CORS setup and no page rerun. While ANY tab is open the worker sees us and
+# pauses its own logging.
+_hb_ms = int(_cfg.get("dashboard_heartbeat_sec", 8)) * 1000
+components.html(
+    f"""
+    <script>
+      const u = "{_wurl}/ping";
+      const ping = () => fetch(u, {{mode:'no-cors', cache:'no-store'}}).catch(()=>{{}});
+      ping();
+      setInterval(ping, {_hb_ms});
+    </script>
+    """,
+    height=0,
+)
 
 # ---- render selected page ----
 if choice == "Calibration" and role == "admin":
