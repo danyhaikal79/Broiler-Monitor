@@ -8,9 +8,18 @@
 set -u
 cd /app
 
-# Worker (engine): keep it alive — auto-restart if it ever crashes.
-echo "[start] worker.py starting (HTTP frame/heartbeat server on :8077)…"
-while true; do
-    python3 worker.py || echo "[start] worker exited (code $?), restarting in 5s…"
+# Stop cleanly on Ctrl+C (SIGINT) or `docker stop` (SIGTERM): set a flag and break the
+# restart loop, so the script exits and the container shuts down instead of relaunching.
+stop=0
+trap 'stop=1; echo "[start] stop signal received — shutting down."' INT TERM
+
+# Worker (engine): auto-restart if it CRASHES, but exit on Ctrl+C.
+echo "[start] worker.py starting (HTTP frame/heartbeat server on :8077). Press Ctrl+C to stop."
+while [ "$stop" -eq 0 ]; do
+    python3 worker.py
+    code=$?
+    [ "$stop" -eq 1 ] && break          # Ctrl+C during the worker -> exit, don't restart
+    echo "[start] worker exited (code $code), restarting in 5s… (Ctrl+C to stop)"
     sleep 5
 done
+echo "[start] stopped."
