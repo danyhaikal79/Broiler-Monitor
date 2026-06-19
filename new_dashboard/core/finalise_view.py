@@ -27,6 +27,18 @@ def _alert_state():
     return st.session_state.setdefault("fin_alert_state", {"last_low": 0.0, "last_heat": 0.0})
 
 
+def _thumb(img, max_w=900):
+    """Downscale a PIL image for display. Big frames make Streamlit's per-tick delta lag,
+    which desyncs parts of the live readout (THI updating before dry/wet-bulb). Smaller
+    images keep each live refresh light so the whole readout updates together."""
+    try:
+        if img is not None and getattr(img, "width", 0) > max_w:
+            return img.resize((max_w, max(1, int(img.height * max_w / img.width))))
+    except Exception:
+        pass
+    return img
+
+
 def _env_inputs(cfg, prefix="fin_env"):
     """Shared Environment sidebar — IDENTICAL widgets in BOTH Live and Upload modes (same
     keys), so switching modes never leaves a stale / duplicate Environment block. The
@@ -91,20 +103,20 @@ def _render_readout(cfg, reading, coverage, images, extras, *, info_caption=""):
         theme.section("vision")
         tabs = st.tabs(["Original", "Feeder", "Feed mask", "Chickens"])
         with tabs[0]:
-            st.image(imgs["original"], use_container_width=True) if imgs.get("original") else st.info("No frame.")
+            st.image(_thumb(imgs["original"]), use_container_width=True) if imgs.get("original") else st.info("No frame.")
         with tabs[1]:
             if imgs.get("feeder"):
-                st.image(imgs["feeder"], use_container_width=True, caption=detected or "no feeder detected")
+                st.image(_thumb(imgs["feeder"]), use_container_width=True, caption=detected or "no feeder detected")
             else:
                 st.info("No feeder view.")
         with tabs[2]:
             if imgs.get("feed_mask"):
-                st.image(imgs["feed_mask"], use_container_width=True,
+                st.image(_thumb(imgs["feed_mask"]), use_container_width=True,
                          caption=f"green = feed · fill {fill*100:.1f}%")
             else:
                 st.info("No feed mask (feeder not detected).")
         with tabs[3]:
-            st.image(imgs["chickens"], use_container_width=True) if imgs.get("chickens") else st.info("No chicken view.")
+            st.image(_thumb(imgs["chickens"]), use_container_width=True) if imgs.get("chickens") else st.info("No chicken view.")
 
     with right:
         theme.section("status")
