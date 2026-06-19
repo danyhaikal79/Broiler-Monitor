@@ -138,50 +138,47 @@ def _render_live(cfg, method, method_display, interval):
     st.caption(f"Pulling live frames from the worker at **{cfg.get('worker_host')}** and analysing "
                "them here on the laptop. The worker logs on its own only when this dashboard is closed.")
 
+    auto, mt, mh, age = _env_inputs(cfg)   # Environment block (outside the auto-rerun fragment)
     live_refresh = max(2, int(cfg.get("live_refresh_sec", 5) or 5))
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=live_refresh * 1000, key="fin_live_refresh")
-    except ImportError:
-        st.caption("⚠️ pip install streamlit-autorefresh for the live view to refresh on its own.")
-    if st.button("🔄 Refresh now", key="fin_live_manual"):
-        st.rerun()
 
-    auto, mt, mh, age = _env_inputs(cfg)   # same Environment block as Upload mode
-
-    img, meta = worker_client.fetch_frame(cfg)
-    if img is None:
-        st.warning(f"⏳ {meta}")
-        st.info("Make sure **worker.py** is running on the Jetson and you're on the same Wi-Fi. "
-                f"You can also open `{worker_client.base_url(cfg)}/health` in a browser to check it.")
-        return
-    # Auto -> use the sensor reading that rode in with this frame; else the manual values.
-    temp, hum = (float(meta["temp"]), float(meta["hum"])) if auto else (float(mt), float(mh))
-
-    cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
-    try:
-        row, coverage, images, extras = engine.analyze_image(
-            cfg, cv_bundle, img, method, temp, hum, age)
-    except Exception as e:
-        st.error(f"⚠️ Inference failed: {e}")
-        return
-
-    # Throttle DB logging to interval_sec (we DISPLAY every refresh, but don't spam the DB).
-    now = time.time()
-    last_log = st.session_state.get("fin_live_last_log", 0.0)
-    if now - last_log >= interval:
+    # Auto-refresh via NATIVE st.fragment(run_every=…) — reliably re-runs ONLY this block on a
+    # timer. (The old 3rd-party streamlit-autorefresh fires once then stops on Streamlit 1.52 —
+    # that was the real "freezes after a frame" cause, not the camera.)
+    def _live_view():
+        img, meta = worker_client.fetch_frame(cfg)
+        if img is None:
+            st.warning(f"⏳ {meta}")
+            st.info("Make sure **worker.py** is running on the Jetson and you're on the same Wi-Fi. "
+                    f"You can also open `{worker_client.base_url(cfg)}/health` in a browser to check it.")
+            return
+        # Auto -> use the sensor reading that rode in with this frame; else the manual values.
+        temp, hum = (float(meta["temp"]), float(meta["hum"])) if auto else (float(mt), float(mh))
+        cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
         try:
-            engine.commit_reading(cfg, row, coverage, source="live", alert_state=_alert_state())
-            st.session_state["fin_live_last_log"] = now
-            log_note = " · ✅ logged"
+            row, coverage, images, extras = engine.analyze_image(
+                cfg, cv_bundle, img, method, temp, hum, age)
         except Exception as e:
-            log_note = f" · ⚠️ log failed: {e}"
-    else:
-        log_note = f" · next log in ~{int(interval - (now - last_log))}s"
+            st.error(f"⚠️ Inference failed: {e}")
+            return
+        # Throttle DB logging to interval_sec (DISPLAY every refresh, but don't spam the DB).
+        now = time.time()
+        last_log = st.session_state.get("fin_live_last_log", 0.0)
+        if now - last_log >= interval:
+            try:
+                engine.commit_reading(cfg, row, coverage, source="live", alert_state=_alert_state())
+                st.session_state["fin_live_last_log"] = now
+                log_note = " · ✅ logged"
+            except Exception as e:
+                log_note = f" · ⚠️ log failed: {e}"
+        else:
+            log_note = f" · next log in ~{int(interval - (now - last_log))}s"
+        src = f"Jetson sensor {temp:.0f}°C / {hum:.0f}% RH" if auto else f"manual {temp:.0f}°C / {hum:.0f}%"
+        _render_readout(cfg, row, coverage, images, extras,
+                        info_caption=f"🎯 {method_display} · 🛰️ live from worker · {src}{log_note}")
 
-    src = f"Jetson sensor {temp:.0f}°C / {hum:.0f}% RH" if auto else f"manual {temp:.0f}°C / {hum:.0f}%"
-    _render_readout(cfg, row, coverage, images, extras,
-                    info_caption=f"🎯 {method_display} · 🛰️ live from worker · {src}{log_note}")
+    # Native fragment auto-rerun (Streamlit ≥1.37). Fallback: render once if unavailable.
+    runner = st.fragment(run_every=live_refresh)(_live_view) if hasattr(st, "fragment") else _live_view
+    runner()
 
 
 # ----------------------------------------------------------------------------
