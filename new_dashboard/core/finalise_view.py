@@ -27,33 +27,25 @@ def _alert_state():
     return st.session_state.setdefault("fin_alert_state", {"last_low": 0.0, "last_heat": 0.0})
 
 
-def _env_block(cfg, prefix):
-    """Environment inputs for the laptop dashboard — supports BOTH auto and manual.
+def _env_inputs(cfg, prefix="fin_env"):
+    """Shared Environment sidebar — IDENTICAL widgets in BOTH Live and Upload modes (same
+    keys), so switching modes never leaves a stale / duplicate Environment block. The
+    DHT-22 is on the JETSON (port fixed there), so 'Auto' uses the live Jetson reading —
+    there is NO COM-port picker on the laptop. Uncheck Auto to type values manually.
 
-    The DHT-22 is on the JETSON (its serial port is fixed in the Jetson's config), so
-    'Auto' pulls the live reading from the worker over the LAN — there is NO COM-port
-    picker on the laptop. Uncheck Auto to type temperature/humidity by hand. Age is
-    always entered here (it isn't a sensor value). Returns (temp, hum, age)."""
+    Returns (auto, manual_temp, manual_hum, age). When auto=True the CALLER supplies the
+    sensor value (Live: from the frame it already fetched; Upload: via worker_client.fetch_env)."""
     st.sidebar.markdown("### 🌡️ Environment")
-    auto = st.sidebar.checkbox("🛰️ Auto — read Jetson sensor", value=True, key=f"{prefix}_auto",
-                               help="Pull the live DHT-22 reading from the Jetson worker. "
-                                    "Uncheck to enter temperature/humidity manually.")
-    age_default = int(config.chicken_age_days(cfg))
-    temp = hum = None
-    if auto:
-        env = worker_client.fetch_env(cfg)
-        if env:
-            temp, hum = float(env["temp"]), float(env["hum"])
-            c1, c2 = st.sidebar.columns(2)
-            c1.metric("Temp", f"{temp:.1f} °C")
-            c2.metric("Humidity", f"{hum:.0f} %")
-        else:
-            st.sidebar.warning("⚠️ Can't reach the Jetson sensor — enter values manually below.")
-    if temp is None:   # manual chosen, or auto failed
-        temp = st.sidebar.number_input("Temperature (°C)", 0.0, 50.0, 25.0, 0.5, key=f"{prefix}_t")
-        hum = st.sidebar.number_input("Humidity (% RH)", 0.0, 100.0, 70.0, 1.0, key=f"{prefix}_h")
-    age = st.sidebar.number_input("Chicken age (days)", 0, 70, age_default, 1, key=f"{prefix}_age")
-    return float(temp), float(hum), int(age)
+    auto = st.sidebar.checkbox("🛰️ Auto — use Jetson sensor", value=True, key=f"{prefix}_auto",
+                               help="Use the live DHT-22 reading from the Jetson. "
+                                    "Uncheck to enter temperature / humidity manually.")
+    mt = mh = None
+    if not auto:
+        mt = st.sidebar.number_input("Temperature (°C)", 0.0, 50.0, 25.0, 0.5, key=f"{prefix}_t")
+        mh = st.sidebar.number_input("Humidity (% RH)", 0.0, 100.0, 70.0, 1.0, key=f"{prefix}_h")
+    age = st.sidebar.number_input("Chicken age (days)", 0, 70, int(config.chicken_age_days(cfg)), 1,
+                                  key=f"{prefix}_age")
+    return auto, mt, mh, int(age)
 
 
 def _render_readout(cfg, reading, coverage, images, extras, *, info_caption=""):
@@ -155,18 +147,7 @@ def _render_live(cfg, method, method_display, interval):
     if st.button("🔄 Refresh now", key="fin_live_manual"):
         st.rerun()
 
-    # Manual environment override (demo / no DHT-22 on the Jetson). Default: use the
-    # sensor reading that travels with each frame.
-    st.sidebar.markdown("### 🌡️ Environment")
-    override = st.sidebar.checkbox("Override sensor (set manually)", value=False, key="fin_live_override",
-                                   help="Use your own temp/humidity/age instead of the Jetson's DHT-22 reading.")
-    ovr = None
-    if override:
-        ot = st.sidebar.number_input("Temperature (°C)", 0.0, 50.0, 25.0, 0.5, key="fin_live_t")
-        oh = st.sidebar.number_input("Humidity (% RH)", 0.0, 100.0, 70.0, 1.0, key="fin_live_h")
-        oa = st.sidebar.number_input("Chicken age (days)", 0, 70, int(config.chicken_age_days(cfg)), 1,
-                                     key="fin_live_a")
-        ovr = {"temp": float(ot), "hum": float(oh), "age": int(oa)}
+    auto, mt, mh, age = _env_inputs(cfg)   # same Environment block as Upload mode
 
     img, meta = worker_client.fetch_frame(cfg)
     if img is None:
@@ -174,12 +155,13 @@ def _render_live(cfg, method, method_display, interval):
         st.info("Make sure **worker.py** is running on the Jetson and you're on the same Wi-Fi. "
                 f"You can also open `{worker_client.base_url(cfg)}/health` in a browser to check it.")
         return
-    env = ovr if ovr else meta   # on success, meta = {temp, hum, age} from the Jetson's sensor
+    # Auto -> use the sensor reading that rode in with this frame; else the manual values.
+    temp, hum = (float(meta["temp"]), float(meta["hum"])) if auto else (float(mt), float(mh))
 
     cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
     try:
         row, coverage, images, extras = engine.analyze_image(
-            cfg, cv_bundle, img, method, env["temp"], env["hum"], env["age"])
+            cfg, cv_bundle, img, method, temp, hum, age)
     except Exception as e:
         st.error(f"⚠️ Inference failed: {e}")
         return
@@ -197,7 +179,7 @@ def _render_live(cfg, method, method_display, interval):
     else:
         log_note = f" · next log in ~{int(interval - (now - last_log))}s"
 
-    src = "manual override" if ovr else f"Jetson sensor {env['temp']:.0f}°C / {env['hum']:.0f}% RH"
+    src = f"Jetson sensor {temp:.0f}°C / {hum:.0f}% RH" if auto else f"manual {temp:.0f}°C / {hum:.0f}%"
     _render_readout(cfg, row, coverage, images, extras,
                     info_caption=f"🎯 {method_display} · 🛰️ live from worker · {src}{log_note}")
 
@@ -213,7 +195,7 @@ def _render_upload(cfg, method, method_display, interval):
     max_frames = 20
     if uploaded is not None and video.is_video(uploaded.name):
         max_frames = st.sidebar.slider("Frames to analyze", 6, 40, 20, 2, key="fin_maxf")
-    temp, hum, age = _env_block(cfg, "fin_up")   # auto (Jetson sensor) or manual — no COM port
+    auto, mt, mh, age = _env_inputs(cfg)   # same Environment block as Live mode
 
     st.info("🛈 **Upload mode** — the dashboard analyses your file here, **logs it to the database**, "
             "and shows the result. (The worker on the Jetson stays paused while this dashboard is open.)")
@@ -233,6 +215,18 @@ def _render_upload(cfg, method, method_display, interval):
         st.error(f"File is {len(data) / 1024 / 1024:.0f} MB — please upload under {MAX_MB} MB.")
         return
     kind = "video" if video.is_video(uploaded.name) else "image"
+
+    # Resolve the environment NOW (only when there's a file to analyse — so idle upload
+    # mode never touches the Jetson). Auto -> read the Jetson sensor; else manual values.
+    if auto:
+        e = worker_client.fetch_env(cfg)
+        if e:
+            temp, hum = float(e["temp"]), float(e["hum"])
+        else:
+            temp, hum = 25.0, 70.0
+            st.warning("⚠️ Couldn't read the Jetson sensor — used 25 °C / 70 %. Uncheck Auto to set manually.")
+    else:
+        temp, hum = float(mt), float(mh)
 
     # Re-ANALYSE when the file/method/frames OR the environment changes (so the readout
     # always matches the current temp/hum/age), but LOG to the DB only ONCE per
