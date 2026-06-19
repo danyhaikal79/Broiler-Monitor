@@ -68,3 +68,11 @@ def fetch_frame(cfg, timeout: float = 10.0):
 
     env = {"temp": _hf("X-Temp", 25.0), "hum": _hf("X-Hum", 70.0), "age": int(_hf("X-Age", 21))}
     return img, env
+
+
+def fetch_env(cfg, timeout: float = 10.0):
+    """The Jetson's current sensor reading {temp, hum, age}, or None if unreachable.
+    Reuses /frame (the reading rides in its headers) so no extra worker endpoint is
+    needed; the image is discarded. Used by the dashboard's 'Auto' environment option."""
+    img, meta = fetch_frame(cfg, timeout=timeout)
+    return meta if img is not None else None

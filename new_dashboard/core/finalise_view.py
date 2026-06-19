@@ -19,12 +19,41 @@ import time
 
 import streamlit as st
 
-from . import theme, video, sensor, inference, config, cv_feeder, engine, worker_client
+from . import theme, video, inference, config, cv_feeder, engine, worker_client
 
 
 def _alert_state():
     """Per-session cooldown timers for the dashboard's alerts (mirrors the worker's)."""
     return st.session_state.setdefault("fin_alert_state", {"last_low": 0.0, "last_heat": 0.0})
+
+
+def _env_block(cfg, prefix):
+    """Environment inputs for the laptop dashboard — supports BOTH auto and manual.
+
+    The DHT-22 is on the JETSON (its serial port is fixed in the Jetson's config), so
+    'Auto' pulls the live reading from the worker over the LAN — there is NO COM-port
+    picker on the laptop. Uncheck Auto to type temperature/humidity by hand. Age is
+    always entered here (it isn't a sensor value). Returns (temp, hum, age)."""
+    st.sidebar.markdown("### 🌡️ Environment")
+    auto = st.sidebar.checkbox("🛰️ Auto — read Jetson sensor", value=True, key=f"{prefix}_auto",
+                               help="Pull the live DHT-22 reading from the Jetson worker. "
+                                    "Uncheck to enter temperature/humidity manually.")
+    age_default = int(config.chicken_age_days(cfg))
+    temp = hum = None
+    if auto:
+        env = worker_client.fetch_env(cfg)
+        if env:
+            temp, hum = float(env["temp"]), float(env["hum"])
+            c1, c2 = st.sidebar.columns(2)
+            c1.metric("Temp", f"{temp:.1f} °C")
+            c2.metric("Humidity", f"{hum:.0f} %")
+        else:
+            st.sidebar.warning("⚠️ Can't reach the Jetson sensor — enter values manually below.")
+    if temp is None:   # manual chosen, or auto failed
+        temp = st.sidebar.number_input("Temperature (°C)", 0.0, 50.0, 25.0, 0.5, key=f"{prefix}_t")
+        hum = st.sidebar.number_input("Humidity (% RH)", 0.0, 100.0, 70.0, 1.0, key=f"{prefix}_h")
+    age = st.sidebar.number_input("Chicken age (days)", 0, 70, age_default, 1, key=f"{prefix}_age")
+    return float(temp), float(hum), int(age)
 
 
 def _render_readout(cfg, reading, coverage, images, extras, *, info_caption=""):
@@ -184,7 +213,7 @@ def _render_upload(cfg, method, method_display, interval):
     max_frames = 20
     if uploaded is not None and video.is_video(uploaded.name):
         max_frames = st.sidebar.slider("Frames to analyze", 6, 40, 20, 2, key="fin_maxf")
-    temp, hum, age = sensor.sidebar_env_inputs("fin")   # Environment section, below the uploader
+    temp, hum, age = _env_block(cfg, "fin_up")   # auto (Jetson sensor) or manual — no COM port
 
     st.info("🛈 **Upload mode** — the dashboard analyses your file here, **logs it to the database**, "
             "and shows the result. (The worker on the Jetson stays paused while this dashboard is open.)")
