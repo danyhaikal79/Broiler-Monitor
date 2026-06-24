@@ -39,3 +39,6 @@ monitor_latest_frame.jpg
 monitor_upload_request.json
 monitor_upload_result.json
 *.tmp
+
+# model backups (kept locally, not committed)
+*.pretrain.bak
