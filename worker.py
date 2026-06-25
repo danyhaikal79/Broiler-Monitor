@@ -48,6 +48,24 @@ def _read_env(cfg):
     return float(cfg.get("temperature_fallback_c", 25.0)), float(cfg.get("humidity_fallback_pct", 70.0))
 
 
+def _lan_ip():
+    """Best-effort primary LAN IP (the address used to reach the network), via a UDP socket
+    to a dummy destination — no data is actually sent. Picks the routed interface (the Wi-Fi
+    IP, not the docker bridge). Returns the IP string, or None if offline."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 # ----------------------------------------------------------------------------
 # Shared state between the main loop and the HTTP server threads
 # ----------------------------------------------------------------------------
@@ -349,6 +367,7 @@ def main():
     alert_state = {"last_low": 0.0, "last_heat": 0.0}
     last_capture_t = -1e9    # so the first autonomous tick captures immediately
     last_present = None      # log state changes only
+    last_publish_t = -1e9    # so we advertise our IP to Supabase immediately
     # Drain any Telegram backlog so we don't reply to stale commands on restart.
     tg_offset = None
     if config.is_telegram_configured(cfg):
@@ -388,6 +407,15 @@ def main():
                 last_present = present
 
             now = time.time()
+
+            # Advertise our current LAN IP so the dashboard finds us without mDNS / manual IP.
+            if config.is_supabase_configured(cfg) and (now - last_publish_t) >= 10.0:
+                _ip = _lan_ip()
+                if _ip and db.publish_worker_status(cfg, _ip, port):
+                    if last_publish_t < 0:
+                        print(f"[worker] advertising address to Supabase: {_ip}:{port}")
+                last_publish_t = now   # advance even on failure so we don't hammer
+
             if (not present) and (now - last_capture_t) >= interval:
                 result = None
                 try:

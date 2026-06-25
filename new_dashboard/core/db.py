@@ -130,3 +130,41 @@ def fetch_alerts(cfg, limit=100) -> list[dict]:
     out = [dict(zip(["ts", "kind", "message", "value"], r)) for r in cur.fetchall()]
     con.close()
     return out
+
+
+# ---------------------------------------------------------------- worker auto-discovery
+# The worker (Jetson) upserts its CURRENT LAN ip:port here every ~10s; the dashboard reads
+# it to locate the worker WITHOUT a hostname/mDNS (flaky for Python on Windows) or a
+# hand-typed IP (changes on a hotspot). One row, name='worker'. Needs the worker_status
+# table (deploy/supabase_worker_status.sql).
+def publish_worker_status(cfg, ip: str, port: int) -> bool:
+    """Worker -> Supabase: upsert this worker's reachable ip:port. Best-effort; never raises."""
+    if not config.is_supabase_configured(cfg) or not ip:
+        return False
+    row = {"name": "worker", "ip": ip, "port": int(port),
+           "updated_at": now_iso(cfg.get("display_tz_offset_hours", 0))}
+    try:
+        headers = dict(_sb_headers(cfg))
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"   # upsert on name
+        r = requests.post(f"{cfg['supabase_url']}/rest/v1/worker_status",
+                          headers=headers, json=row, timeout=10)
+        return r.status_code in (200, 201, 204)
+    except Exception:
+        return False
+
+
+def fetch_worker_status(cfg):
+    """Dashboard <- Supabase: the worker's published {name, ip, port, updated_at}, or None."""
+    if not config.is_supabase_configured(cfg):
+        return None
+    try:
+        r = requests.get(
+            f"{cfg['supabase_url']}/rest/v1/worker_status",
+            headers={"apikey": cfg["supabase_key"], "Authorization": f"Bearer {cfg['supabase_key']}"},
+            params={"select": "*", "name": "eq.worker", "limit": "1"}, timeout=8)
+        if r.status_code == 200:
+            rows = r.json()
+            return rows[0] if rows else None
+    except Exception:
+        pass
+    return None

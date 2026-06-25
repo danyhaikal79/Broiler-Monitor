@@ -31,7 +31,7 @@ _DEFAULTS = {
     # --- split deployment: dashboard (laptop) <-> worker (Jetson) over the LAN ---
     # The dashboard reaches the worker by its mDNS HOSTNAME (not its IP, which changes
     # on a hotspot). The worker serves /frame + /ping on worker_http_port.
-    "worker_host": "jetson00-desktop.local",  # set to the Jetson's hostname (or 127.0.0.1 for an all-in-one test)
+    "worker_host": "auto",  # 'auto' = discover the worker's IP from Supabase (recommended). Or a hostname/IP, or 127.0.0.1.
     "worker_http_port": 8077,                 # worker's frame/heartbeat HTTP server
     "presence_timeout_sec": 25,               # worker logs on its own if no dashboard ping within this many seconds
     "dashboard_heartbeat_sec": 8,             # how often the (open) dashboard pings the worker, browser-side

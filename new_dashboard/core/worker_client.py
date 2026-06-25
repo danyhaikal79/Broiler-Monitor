@@ -16,15 +16,40 @@ calls (no browser CORS involved).
 from __future__ import annotations
 
 import io
+import time
 
 import requests
 from PIL import Image
 
+from . import db
+
+# Cache the auto-discovered worker URL so we don't query Supabase on every ping/frame.
+_DISCOVER = {"url": None, "t": 0.0}
+_DISCOVER_TTL = 15.0   # re-check the worker's published IP at most this often (seconds)
+
 
 def base_url(cfg) -> str:
-    host = cfg.get("worker_host", "jetson00-desktop.local")
+    """The worker's base URL.
+
+    - worker_host = a real hostname/IP  -> use it directly (manual override).
+    - worker_host = 'auto' (default)    -> discover the worker's CURRENT ip:port from
+      Supabase (it publishes there every ~10s), cached. No mDNS, no hand-typed IP,
+      survives the Jetson's IP changing on a hotspot."""
+    host = (cfg.get("worker_host") or "auto").strip()
     port = int(cfg.get("worker_http_port", 8077))
-    return f"http://{host}:{port}"
+    if host.lower() not in ("auto", ""):
+        return f"http://{host}:{port}"
+
+    now = time.time()
+    if _DISCOVER["url"] and (now - _DISCOVER["t"] < _DISCOVER_TTL):
+        return _DISCOVER["url"]
+    status = db.fetch_worker_status(cfg)
+    if status and status.get("ip"):
+        _DISCOVER["url"] = f"http://{status['ip']}:{int(status.get('port') or port)}"
+        _DISCOVER["t"] = now
+        return _DISCOVER["url"]
+    # nothing published yet -> keep last known if any, else an address that just fails fast
+    return _DISCOVER["url"] or f"http://0.0.0.0:{port}"
 
 
 def ping_url(url: str, timeout: float = 2.5) -> bool:
