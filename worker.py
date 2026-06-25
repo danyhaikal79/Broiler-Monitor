@@ -76,24 +76,35 @@ class Shared:
         self.last_contact_t = 0.0               # last time the dashboard pinged/fetched
         self.latest_env = (float(cfg.get("temperature_fallback_c", 25.0)),
                            float(cfg.get("humidity_fallback_pct", 70.0)))
-        self._cap = None                        # camera handle (owned ONLY by the grabber thread)
-        self._latest_frame = None               # most recent BGR frame, kept fresh by the grabber
+        self._cap = None                        # camera handle (owned by the grabber)
+        self._latest_frame = None               # most recent BGR frame, kept fresh WHILE watching
         self._frame_lock = threading.Lock()
+        self._cam_lock = threading.Lock()       # serialize camera open/read/release (grabber vs on-demand)
         self._grab_started = False
+        self._last_frame_t = 0.0                # last time a live /frame was pulled
+        self._frame_window = 15.0               # keep the camera live this long after the last /frame
 
     def mark_contact(self):
         with self._contact_lock:
             self.last_contact_t = time.time()
 
+    def mark_frame(self):
+        """A live /frame was just pulled -> keep the camera running (someone's watching live)."""
+        self._last_frame_t = time.time()
+
     def seconds_since_contact(self):
         with self._contact_lock:
             return time.time() - self.last_contact_t
 
-    # --- Camera: a BACKGROUND grabber thread continuously reads the latest frame and keeps
-    #     the driver's buffer drained. Polling a USB camera slowly (one frame every few
-    #     seconds) otherwise fills its internal buffer and the NEXT read FREEZES — exactly
-    #     the "live works for a few frames then sticks" symptom. /frame just returns the most
-    #     recent grabbed frame, so the request path never blocks on (or stalls) the camera.
+    def _watching(self):
+        """True while the dashboard is actively pulling live frames."""
+        return (time.time() - self._last_frame_t) < self._frame_window
+
+    # --- Camera, presence-aware. While the dashboard is actively WATCHING LIVE (pulling
+    #     /frame), a background grabber keeps the camera open and the latest frame fresh —
+    #     smooth, and it drains the driver buffer so slow polling can't FREEZE the feed.
+    #     When nobody is watching live, the camera is RELEASED (LED off, no CPU); autonomous
+    #     logging and Telegram /capture just open it on-demand for a single shot.
     def _open_cam(self):
         import cv2
         import platform
@@ -129,37 +140,66 @@ class Shared:
         threading.Thread(target=self._grab_loop, name="cam-grabber", daemon=True).start()
 
     def _grab_loop(self):
+        """Keep the camera open + the latest frame fresh ONLY while watching live; else OFF."""
         while True:
             try:
-                if self._cap is None or not self._cap.isOpened():
-                    self._release_cam()
-                    self._cap = self._open_cam()
-                    if self._cap is None:
-                        time.sleep(2.0)              # no camera yet — keep retrying
-                        continue
-                ok, frame = self._cap.read()         # blocks ~1/fps, so the loop self-paces
-                if not ok or frame is None:
-                    self._release_cam()
-                    time.sleep(0.5)
+                if not self._watching():
+                    with self._cam_lock:
+                        self._release_cam()            # nobody watching live -> camera OFF
+                    with self._frame_lock:
+                        self._latest_frame = None
+                    time.sleep(1.0)
                     continue
-                with self._frame_lock:
-                    self._latest_frame = frame
+                with self._cam_lock:
+                    if self._cap is None or not self._cap.isOpened():
+                        self._cap = self._open_cam()
+                    ok, frame = self._cap.read() if self._cap is not None else (False, None)
+                    if not ok or frame is None:
+                        self._release_cam()
+                if ok and frame is not None:
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                else:
+                    time.sleep(0.5)                     # camera not ready yet -> back off
             except Exception as e:
                 print(f"[worker] camera grabber error: {e}")
-                self._release_cam()
+                with self._cam_lock:
+                    self._release_cam()
                 time.sleep(1.0)
 
+    def _grab_one_ondemand(self):
+        """Open the camera, grab ONE fresh frame, release it. Returns a BGR frame or None.
+        Used when nobody's watching live (grabber idle): autonomous logging, /capture."""
+        cap = self._open_cam()
+        if cap is None:
+            return None
+        try:
+            for _ in range(3):     # discard warm-up frames
+                cap.read()
+            ok, frame = cap.read()
+            return frame if (ok and frame is not None) else None
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
     def capture_pil(self):
-        """Most recent frame from the grabber. Returns a PIL.Image, or None if none yet."""
+        """A PIL frame. While watching live -> the latest grabbed frame (instant; None for the
+        first few seconds while the camera warms up). When idle -> open the camera on-demand
+        for a single shot (autonomous logging / Telegram /capture)."""
         import cv2
         with self._frame_lock:
             frame = self._latest_frame.copy() if self._latest_frame is not None else None
+        if frame is None and not self._watching():     # idle -> on-demand single shot
+            with self._cam_lock:
+                frame = self._grab_one_ondemand()
         if frame is None:
             return None
         return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
     def capture_jpeg(self):
-        """JPEG-encode the most recent frame. Returns bytes, or None if no frame yet."""
+        """JPEG-encode a frame. Returns bytes, or None if no frame available."""
         img = self.capture_pil()
         if img is None:
             return None
@@ -196,6 +236,7 @@ def _make_handler(shared):
                 self._send_json({"ok": True, "role": "worker",
                                  "since_contact_s": round(shared.seconds_since_contact(), 1)})
             elif path == "/frame":
+                shared.mark_frame()   # someone is watching live -> keep the camera running
                 jpg = shared.capture_jpeg()
                 if jpg is None:
                     self._send_json({"error": "camera unavailable"}, status=503)
