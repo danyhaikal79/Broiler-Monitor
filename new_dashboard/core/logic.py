@@ -42,6 +42,7 @@ FEEDER_MAX_KG: dict[str, float] = {
     "pan3kg": 3.0,
     "pan7kg": 7.0,
     "tube7kg": 7.0,
+    "feeder-demo-3kg": 3.0,   # demo / dummy farm prototype (Method 3)
 }
 
 

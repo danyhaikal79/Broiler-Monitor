@@ -36,7 +36,7 @@ _DEFAULTS = {
     "presence_timeout_sec": 25,               # worker logs on its own if no dashboard ping within this many seconds
     "dashboard_heartbeat_sec": 8,             # how often the (open) dashboard pings the worker, browser-side
     "live_refresh_sec": 5,                    # live-mode frame fetch + display cadence on the dashboard
-    "feeder_method": 1,  # 1 = whole feeder, 2 = open area, 3 = demo/dummy farm
+    "feeder_method": 3,  # 1 = whole feeder, 2 = open area, 3 = demo/dummy farm (default)
     "display_tz_offset_hours": 8,    # store UTC, DISPLAY local; Malaysia (MYT) = +8
     "display_tz_label": "MYT",
     "feeder_type": "pan7kg", "flock_start_date": None,

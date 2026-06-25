@@ -35,7 +35,7 @@ _CORE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = _CORE_DIR / "cv_config.json"                 # Method 1 (whole feeder)
 CONFIG_PATH_METHOD2 = _CORE_DIR / "cv_config_method2.json"  # Method 2 (open area)
 CONFIG_PATH_METHOD3 = _CORE_DIR / "cv_config_method3.json"  # Method 3 (demo / dummy farm)
-FEEDER_TYPES = ("pan3kg", "pan7kg", "tube7kg")
+FEEDER_TYPES = ("pan3kg", "pan7kg", "tube7kg", "feeder-demo-3kg")
 
 
 def config_path_for(method: int = 1) -> Path:
@@ -83,45 +83,43 @@ class FeederCVConfig:
 
 @dataclass
 class CVConfigBundle:
-    """All three per-feeder configs stored together."""
-    pan3kg: FeederCVConfig = field(default_factory=FeederCVConfig)
-    pan7kg: FeederCVConfig = field(default_factory=FeederCVConfig)
-    tube7kg: FeederCVConfig = field(default_factory=FeederCVConfig)
+    """Per-feeder CV configs, keyed by feeder-type NAME. A dict (not fixed fields) so it
+    accepts any type — including the hyphenated demo type 'feeder-demo-3kg'."""
+    configs: dict = field(default_factory=dict)
 
     def get(self, feeder_type: str) -> FeederCVConfig:
-        return getattr(self, feeder_type, self.pan3kg)
+        return self.configs.get(feeder_type) or FeederCVConfig()
 
     def set(self, feeder_type: str, cfg: FeederCVConfig) -> None:
-        setattr(self, feeder_type, cfg)
+        self.configs[feeder_type] = cfg
 
     def save(self, path: Path = CONFIG_PATH) -> None:
-        data = {ft: getattr(self, ft).__dict__ for ft in FEEDER_TYPES}
+        data = {ft: c.__dict__ for ft, c in self.configs.items()}
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "CVConfigBundle":
-        if not path.exists():
-            return cls()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return cls()
+        bundle = cls()
+        data = {}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
 
-        # Backward-compat: old single-config format -> put into pan3kg slot
-        if "roi_x1_pct" in data:
-            bundle = cls()
+        if "roi_x1_pct" in data:                       # backward-compat: old single-config format
             old = FeederCVConfig(**{k: v for k, v in data.items()
                                     if k in FeederCVConfig.__annotations__})
-            ft = data.get("feeder_type", "pan3kg")
-            if ft in FEEDER_TYPES:
-                bundle.set(ft, old)
-            return bundle
+            bundle.configs[data.get("feeder_type", "pan3kg")] = old
+        else:                                          # multi-config: load every key present
+            for ft, c in data.items():
+                try:
+                    bundle.configs[ft] = FeederCVConfig(**c)
+                except Exception:
+                    pass
 
-        # New multi-config format
-        bundle = cls()
-        for ft in FEEDER_TYPES:
-            if ft in data:
-                bundle.set(ft, FeederCVConfig(**data[ft]))
+        for ft in FEEDER_TYPES:                        # ensure known types are always editable
+            bundle.configs.setdefault(ft, FeederCVConfig())
         return bundle
 
 

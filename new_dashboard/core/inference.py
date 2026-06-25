@@ -50,10 +50,17 @@ FEEDER_WEIGHTS_BY_METHOD = {
 # Shared UI labels for the feeder-estimation methods.
 METHOD_LABELS = {1: "Method 1 · whole feeder", 2: "Method 2 · open area", 3: "Method 3 · demo"}
 
-# Feeder class IDs (new 3-class model, from new_feeder_dataset):
-#   0: pan3kg, 1: pan7kg, 2: tube7kg  (no 'feed' class -- CV handles feed level)
+# Feeder class IDs. Method 1/2 use the 3-class model (pan3kg/pan7kg/tube7kg). Method 3's
+# demo model has a SINGLE class which we present as the 'feeder-demo-3kg' dummy feeder, so
+# the rest of the system (CV config, calibration, kg) works exactly like the real feeders.
 FEEDER_CLASS_NAMES = {0: "pan3kg", 1: "pan7kg", 2: "tube7kg"}
-FEEDER_TYPES = {"pan3kg", "pan7kg", "tube7kg"}
+FEEDER_CLASS_NAMES_M3 = {0: "feeder-demo-3kg"}
+FEEDER_TYPES = {"pan3kg", "pan7kg", "tube7kg", "feeder-demo-3kg"}
+
+
+def _feeder_class_names(method: int) -> dict:
+    """Class-id -> feeder-type map for the given method's model."""
+    return FEEDER_CLASS_NAMES_M3 if int(method) == 3 else FEEDER_CLASS_NAMES
 
 
 # ----------------------------------------------------------------------------
@@ -189,7 +196,7 @@ def run_feeder(image: Image.Image, conf: float = 0.25, method: int = 1) -> Feede
         for poly, cls_id, c, xyxy in zip(polys, cls_ids, confs, xyxys):
             if len(poly) < 3:
                 continue
-            name = FEEDER_CLASS_NAMES.get(int(cls_id), "?")
+            name = _feeder_class_names(method).get(int(cls_id), "?")
             if name in FEEDER_TYPES and c > best_feeder_conf:
                 best_feeder_conf = float(c)
                 detected_feeder = name

@@ -278,8 +278,11 @@ def render(role: str | None = None, show_header: bool = True):
 
     # ---- Feed-estimation method selector ----
     st.sidebar.markdown("### 🎯 Feed method")
+    _m_keys = list(inference.METHOD_LABELS.keys())
+    _m_def = int(cfg.get("feeder_method", 1))
+    _m_idx = _m_keys.index(_m_def) if _m_def in _m_keys else 0
     method_label = st.sidebar.radio(
-        "Estimation method", list(inference.METHOD_LABELS.values()),
+        "Estimation method", list(inference.METHOD_LABELS.values()), index=_m_idx,
         label_visibility="collapsed", key="fin_method",
         help="Method 1 = whole-feeder ROI · Method 2 = open-area ROI · Method 3 = demo (dummy farm).")
     method = next((m for m, lbl in inference.METHOD_LABELS.items() if lbl == method_label), 1)
