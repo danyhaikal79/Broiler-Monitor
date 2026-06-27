@@ -37,7 +37,8 @@ ROOT = _find_project_root()
 FEEDER_WEIGHTS = ROOT / "feeder_train" / "runs" / "seg_compare" / "yolov8n" / "weights" / "best.pt"
 FEEDER_WEIGHTS_M2 = ROOT / "feeder_train" / "runs" / "method2" / "weights" / "best.pt"
 FEEDER_WEIGHTS_M3 = ROOT / "feeder_train" / "runs" / "method3" / "weights" / "best.pt"   # not trained yet
-CHICKEN_WEIGHTS = ROOT / "chicken_train" / "runs" / "chicken_compare" / "yolo11n" / "weights" / "best.pt"
+CHICKEN_WEIGHTS = ROOT / "chicken_train" / "runs" / "chicken_compare" / "yolo11n" / "weights" / "best.pt"        # Methods 1/2 (real broilers)
+CHICKEN_WEIGHTS_DEMO = ROOT / "chicken_train" / "runs" / "chicken_demo" / "yolo11n" / "weights" / "best.pt"      # Method 3 (demo birds)
 
 FEEDER_WEIGHTS_BY_METHOD = {
     1: FEEDER_WEIGHTS,
@@ -66,8 +67,8 @@ def _feeder_class_names(method: int) -> dict:
 # ----------------------------------------------------------------------------
 # Lazy model loading -- import ultralytics only when needed (it's slow to load)
 # ----------------------------------------------------------------------------
-_feeder_models = {}   # method (1|2) -> loaded YOLO model (cached)
-_chicken_model = None
+_feeder_models = {}    # weights-path -> loaded feeder YOLO model (cached)
+_chicken_models = {}   # weights-path -> loaded chicken YOLO model (cached: original + demo)
 
 # Serialize YOLO inference: the dashboard may run predict from concurrent Streamlit
 # sessions/reruns on the same cached model object, and Ultralytics models aren't safe
@@ -106,15 +107,18 @@ def load_feeder_model(method: int = 1):
     return _feeder_models[key]
 
 
-def load_chicken_model():
-    global _chicken_model
-    if _chicken_model is None:
+def load_chicken_model(method: int = 1):
+    """Method 3 (demo) uses the demo-trained chicken model; Methods 1/2 use the original
+    (real-broiler) model. Cached by weights path so each loads once."""
+    global _chicken_models
+    weights = _prefer_engine(CHICKEN_WEIGHTS_DEMO if int(method) == 3 else CHICKEN_WEIGHTS)
+    key = str(weights)
+    if key not in _chicken_models:
         from ultralytics import YOLO
-        weights = _prefer_engine(CHICKEN_WEIGHTS)
         if not weights.exists():
             raise FileNotFoundError(f"Chicken weights not found: {weights}")
-        _chicken_model = YOLO(str(weights))
-    return _chicken_model
+        _chicken_models[key] = YOLO(key)
+    return _chicken_models[key]
 
 
 # ----------------------------------------------------------------------------
@@ -227,9 +231,10 @@ def run_feeder(image: Image.Image, conf: float = 0.25, method: int = 1) -> Feede
     )
 
 
-def run_chicken(image: Image.Image, conf: float = 0.25) -> ChickenResult:
-    """Run the chicken detection model. Returns count + annotated preview."""
-    model = load_chicken_model()
+def run_chicken(image: Image.Image, conf: float = 0.25, method: int = 1) -> ChickenResult:
+    """Run the chicken detection model (Method 3 = demo model, else the original real-broiler
+    model). Returns count + annotated preview."""
+    model = load_chicken_model(method)
     arr = np.array(image.convert("RGB"))
     with _PREDICT_LOCK:
         results = model.predict(arr, conf=conf, verbose=False)

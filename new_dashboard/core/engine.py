@@ -31,7 +31,7 @@ def analyze_image(cfg, cv_bundle, img, method, temp, hum, age):
     """Analyse ONE PIL image -> (reading_row, coverage, images, extras).
     `images` = the 4 readout views (PIL); `extras` = extra display numbers."""
     feeder = inference.run_feeder(img, method=method)
-    chicken = inference.run_chicken(img)
+    chicken = inference.run_chicken(img, method=method)
     ftype = feeder.feeder_type or cfg.get("feeder_type", "pan7kg")
     cvm = cv_feeder.measure(img, cv_bundle, ftype,
                             yolo_polygon=feeder.feeder_polygon, yolo_bbox=feeder.feeder_bbox)

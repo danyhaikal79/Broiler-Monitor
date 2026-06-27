@@ -388,7 +388,7 @@ def main():
     try:
         print("[worker] loading models (one-time warm-up, can take ~30-90s on Jetson)…")
         inference.load_feeder_model(method)
-        inference.load_chicken_model()
+        inference.load_chicken_model(method)
         print("[worker] models ready.")
     except Exception as e:
         print(f"[worker] model warm-up skipped ({e}); will load on first use.")
