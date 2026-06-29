@@ -192,6 +192,10 @@ def run_feeder(image: Image.Image, conf: float | None = None, method: int = 1) -
     if conf is None:
         conf = 0.15 if int(method) == 3 else 0.25
     model = load_feeder_model(method)
+    # NB: hand the model a numpy array (Ultralytics reads numpy as BGR). Unlike
+    # run_chicken, do NOT "fix" this to a PIL/RGB image — the feeder model detects the
+    # metal cup FAR better on this path (correct-colour input dropped cup detections to
+    # ~0 in testing). Re-verify detection counts before ever changing this.
     arr = np.array(image.convert("RGB"))
     with _PREDICT_LOCK:
         results = model.predict(arr, conf=conf, verbose=False)
