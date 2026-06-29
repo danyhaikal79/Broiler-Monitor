@@ -370,7 +370,7 @@ def main():
         print(f"[worker] feeder_method={method} model missing — falling back to Method 1.")
         method = 1
         cfg["feeder_method"] = 1
-    cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
+    cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method), method)
     interval = int(cfg.get("interval_sec", 600))
     presence_timeout = float(cfg.get("presence_timeout_sec", 25))
     port = int(cfg.get("worker_http_port", 8077))
@@ -436,7 +436,7 @@ def main():
                     cfg["feeder_method"] = 1
                 if new_method != method:
                     method = new_method
-                    cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
+                    cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method), method)
                 interval = int(cfg.get("interval_sec", 600))
                 presence_timeout = float(cfg.get("presence_timeout_sec", 25))
                 shared.latest_env = _read_env(cfg)

@@ -67,11 +67,12 @@ def render(role: str | None = None, show_header: bool = True):
         st.sidebar.warning(f"⚠️ {inference.METHOD_LABELS[method]} model not available — you can still "
                            "pre-tune its config, but YOLO ROI previews need a trained model.")
     cfg_path = cv_feeder.config_path_for(method)
-    cv_bundle = cv_feeder.CVConfigBundle.load(cfg_path)
+    cv_bundle = cv_feeder.CVConfigBundle.load(cfg_path, method)
 
     # ---- sidebar: which feeder + detection config ----
     st.sidebar.markdown("### ⚙️ Config target")
-    active = st.sidebar.selectbox("Feeder type to edit", list(FEEDER_TYPES), key="cal_active")
+    active = st.sidebar.selectbox("Feeder type to edit",
+                                  list(cv_feeder.feeder_types_for(method)), key="cal_active")
     cfg = cv_bundle.get(active)
     mk = f"{active}_m{method}"   # widget-key suffix: per feeder AND per method (no cross-bleed)
     previews_ok = inference.feeder_method_available(method)   # YOLO ROI previews need this method's model

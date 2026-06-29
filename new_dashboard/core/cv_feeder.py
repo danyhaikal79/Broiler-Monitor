@@ -37,6 +37,16 @@ CONFIG_PATH_METHOD2 = _CORE_DIR / "cv_config_method2.json"  # Method 2 (open are
 CONFIG_PATH_METHOD3 = _CORE_DIR / "cv_config_method3.json"  # Method 3 (demo / dummy farm)
 FEEDER_TYPES = ("pan3kg", "pan7kg", "tube7kg", "feeder-demo-3kg")
 
+# Which feeder types belong to each method. Methods 1/2 are the real feeders; Method 3
+# is the demo, whose ONLY feeder is the dummy cup. Keeping these separate stops a
+# method's config file from accumulating types it never uses, and stops cross-method
+# pollution (e.g. calibrating the demo while on Method 1 landing in Method 1's file).
+FEEDER_TYPES_BY_METHOD = {
+    1: ("pan3kg", "pan7kg", "tube7kg"),
+    2: ("pan3kg", "pan7kg", "tube7kg"),
+    3: ("feeder-demo-3kg",),
+}
+
 
 def config_path_for(method: int = 1) -> Path:
     """Which CV-config file backs a given method (each is calibrated separately)."""
@@ -45,6 +55,13 @@ def config_path_for(method: int = 1) -> Path:
     if method == 3:
         return CONFIG_PATH_METHOD3
     return CONFIG_PATH
+
+
+def feeder_types_for(method: int | None = None) -> tuple:
+    """Feeder types relevant to a method (all of them if method is None)."""
+    if method is None:
+        return FEEDER_TYPES
+    return FEEDER_TYPES_BY_METHOD.get(int(method), FEEDER_TYPES)
 
 
 # ----------------------------------------------------------------------------
@@ -98,7 +115,11 @@ class CVConfigBundle:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: Path = CONFIG_PATH) -> "CVConfigBundle":
+    def load(cls, path: Path = CONFIG_PATH, method: int | None = None) -> "CVConfigBundle":
+        """Load the per-feeder configs from `path`. If `method` is given, only that
+        method's feeder types are kept/created (see FEEDER_TYPES_BY_METHOD) — so e.g.
+        Method 3's file holds ONLY feeder-demo-3kg, and a stray entry from another method
+        is dropped on the next save instead of accumulating. method=None keeps all types."""
         bundle = cls()
         data = {}
         if path.exists():
@@ -107,18 +128,22 @@ class CVConfigBundle:
             except Exception:
                 data = {}
 
+        allowed = feeder_types_for(method)
         if "roi_x1_pct" in data:                       # backward-compat: old single-config format
-            old = FeederCVConfig(**{k: v for k, v in data.items()
-                                    if k in FeederCVConfig.__annotations__})
-            bundle.configs[data.get("feeder_type", "pan3kg")] = old
-        else:                                          # multi-config: load every key present
+            ft = data.get("feeder_type", "pan3kg")
+            if ft in allowed:
+                bundle.configs[ft] = FeederCVConfig(**{k: v for k, v in data.items()
+                                                       if k in FeederCVConfig.__annotations__})
+        else:                                          # multi-config: load every RELEVANT key
             for ft, c in data.items():
+                if ft not in allowed:                  # skip types that don't belong to this method
+                    continue
                 try:
                     bundle.configs[ft] = FeederCVConfig(**c)
                 except Exception:
                     pass
 
-        for ft in FEEDER_TYPES:                        # ensure known types are always editable
+        for ft in allowed:                             # ensure this method's types are editable
             bundle.configs.setdefault(ft, FeederCVConfig())
         return bundle
 

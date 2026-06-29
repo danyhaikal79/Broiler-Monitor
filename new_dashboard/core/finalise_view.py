@@ -165,7 +165,7 @@ def _render_live(cfg, method, method_display, interval):
             return
         # Auto -> use the sensor reading that rode in with this frame; else the manual values.
         temp, hum = (float(meta["temp"]), float(meta["hum"])) if auto else (float(mt), float(mh))
-        cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
+        cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method), method)
         try:
             row, coverage, images, extras = engine.analyze_image(
                 cfg, cv_bundle, img, method, temp, hum, age)
@@ -245,7 +245,7 @@ def _render_upload(cfg, method, method_display, interval):
     analyze_sig = file_sig + f"_t{float(temp):.1f}_h{float(hum):.0f}_a{int(age)}"
     cache = st.session_state.get("fin_upload_cache")
     if not cache or cache.get("sig") != analyze_sig:
-        cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method))
+        cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method), method)
         with st.spinner("Analyzing…"):
             try:
                 row, coverage, images, extras = engine.analyze_upload(
