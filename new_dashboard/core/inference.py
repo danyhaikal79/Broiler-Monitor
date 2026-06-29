@@ -231,13 +231,22 @@ def run_feeder(image: Image.Image, conf: float = 0.25, method: int = 1) -> Feede
     )
 
 
-def run_chicken(image: Image.Image, conf: float = 0.25, method: int = 1) -> ChickenResult:
+def run_chicken(image: Image.Image, conf: float = 0.5, method: int = 1) -> ChickenResult:
     """Run the chicken detection model (Method 3 = demo model, else the original real-broiler
-    model). Returns count + annotated preview."""
+    model). Returns count + annotated preview.
+
+    conf defaults to 0.5: real birds are detected at 0.85-0.97, while the occasional
+    spurious box (on bedding / the feeder cup) lands below ~0.45 — so 0.5 trims the
+    low-confidence false positives that over-count the flock, with a wide margin below
+    real birds (test-split recall stays ~98%)."""
     model = load_chicken_model(method)
-    arr = np.array(image.convert("RGB"))
+    # Pass the PIL image (RGB) straight to Ultralytics. Do NOT hand it a numpy array
+    # here: Ultralytics treats numpy input as BGR (OpenCV convention), so an RGB array
+    # silently swaps the red/blue channels — the birds' orange heads read as blue and
+    # detection collapses (e.g. 10 birds -> 0). PIL input is correctly read as RGB.
+    img_rgb = image.convert("RGB")
     with _PREDICT_LOCK:
-        results = model.predict(arr, conf=conf, verbose=False)
+        results = model.predict(img_rgb, conf=conf, verbose=False)
     res = results[0]
 
     count = 0
