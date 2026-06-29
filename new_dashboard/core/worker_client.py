@@ -95,9 +95,16 @@ def fetch_frame(cfg, timeout: float = 10.0):
     return img, env
 
 
-def fetch_env(cfg, timeout: float = 10.0):
-    """The Jetson's current sensor reading {temp, hum, age}, or None if unreachable.
-    Reuses /frame (the reading rides in its headers) so no extra worker endpoint is
-    needed; the image is discarded. Used by the dashboard's 'Auto' environment option."""
-    img, meta = fetch_frame(cfg, timeout=timeout)
-    return meta if img is not None else None
+def fetch_env(cfg, timeout: float = 4.0):
+    """The Jetson's current sensor reading {temp, hum, age} via the lightweight /env endpoint.
+    No camera — so reading the sensor never wakes the camera or waits on its warm-up.
+    Returns the dict, or None if unreachable. Used by the dashboard's 'Auto' environment option."""
+    try:
+        r = requests.get(base_url(cfg) + "/env", timeout=timeout)
+        if r.status_code == 200:
+            d = r.json()
+            return {"temp": float(d.get("temp", 25.0)), "hum": float(d.get("hum", 70.0)),
+                    "age": int(d.get("age", 21))}
+    except Exception:
+        pass
+    return None

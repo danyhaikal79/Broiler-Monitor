@@ -235,6 +235,11 @@ def _make_handler(shared):
             elif path == "/health":
                 self._send_json({"ok": True, "role": "worker",
                                  "since_contact_s": round(shared.seconds_since_contact(), 1)})
+            elif path == "/env":
+                # Sensor reading only — NO camera (so reading the sensor never wakes it).
+                t, h = shared.latest_env
+                self._send_json({"temp": round(float(t), 1), "hum": round(float(h), 1),
+                                 "age": int(config.chicken_age_days(shared.cfg))})
             elif path == "/frame":
                 shared.mark_frame()   # someone is watching live -> keep the camera running
                 jpg = shared.capture_jpeg()
