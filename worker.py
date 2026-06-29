@@ -356,7 +356,11 @@ def handle_telegram_commands(cfg, cv_bundle, method, offset, shared, alert_state
                        "/status – latest reading (live or worker-logged)\n"
                        "/latest – last saved reading\n"
                        "/capture – grab a fresh frame now")
-        print(f"[worker] telegram cmd: {cmd}")
+        msg_date = msg.get("date")   # unix secs: when the user sent the command
+        if msg_date:
+            print(f"[worker] telegram cmd: {cmd} round-trip {time.time() - msg_date:.1f}s", flush=True)
+        else:
+            print(f"[worker] telegram cmd: {cmd}", flush=True)
     return offset
 
 
