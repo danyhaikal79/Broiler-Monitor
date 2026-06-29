@@ -125,5 +125,66 @@
         "known_kg": 7.0
       }
     ]
+  },
+  "feeder-demo-3kg": {
+    "roi_x1_pct": 30.0,
+    "roi_y1_pct": 30.0,
+    "roi_x2_pct": 70.0,
+    "roi_y2_pct": 70.0,
+    "detect_method": "hsv",
+    "hsv_h_min": 0,
+    "hsv_h_max": 179,
+    "hsv_s_min": 0,
+    "hsv_s_max": 38,
+    "hsv_v_min": 169,
+    "hsv_v_max": 255,
+    "texture_threshold": 12.0,
+    "texture_window": 7,
+    "samples": [
+      {
+        "fill_ratio": 0.0285,
+        "known_kg": 0.0
+      },
+      {
+        "fill_ratio": 0.1255,
+        "known_kg": 0.3
+      },
+      {
+        "fill_ratio": 0.178,
+        "known_kg": 0.6
+      },
+      {
+        "fill_ratio": 0.276,
+        "known_kg": 0.9
+      },
+      {
+        "fill_ratio": 0.3643,
+        "known_kg": 1.2
+      },
+      {
+        "fill_ratio": 0.4055,
+        "known_kg": 1.5
+      },
+      {
+        "fill_ratio": 0.519,
+        "known_kg": 1.8
+      },
+      {
+        "fill_ratio": 0.555,
+        "known_kg": 2.1
+      },
+      {
+        "fill_ratio": 0.628,
+        "known_kg": 2.4
+      },
+      {
+        "fill_ratio": 0.686,
+        "known_kg": 2.7
+      },
+      {
+        "fill_ratio": 0.8055,
+        "known_kg": 3.0
+      }
+    ]
   }
 }

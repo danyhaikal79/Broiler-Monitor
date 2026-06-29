@@ -43,9 +43,11 @@ CHICKEN_WEIGHTS_DEMO = ROOT / "chicken_train" / "runs" / "chicken_demo" / "yolo1
 FEEDER_WEIGHTS_BY_METHOD = {
     1: FEEDER_WEIGHTS,
     2: FEEDER_WEIGHTS_M2,
-    # Demo: use its own model once feeder_train/runs/method3/weights/best.pt exists,
-    # otherwise fall back to Method 2's model for now.
-    3: FEEDER_WEIGHTS_M3 if FEEDER_WEIGHTS_M3.exists() else FEEDER_WEIGHTS_M2,
+    # Demo (Method 3): the round metal demo cup looks like a small pan, so the ORIGINAL
+    # 3-class feeder model (Method 1's) segments it tighter + steadier than the
+    # purpose-trained demo model did (which over-segmented into the bedding). Reuse that
+    # model here; run_feeder remaps whatever class it returns to the single demo type.
+    3: FEEDER_WEIGHTS,
 }
 
 # Shared UI labels for the feeder-estimation methods.
@@ -55,7 +57,10 @@ METHOD_LABELS = {1: "Method 1 · whole feeder", 2: "Method 2 · open area", 3: "
 # demo model has a SINGLE class which we present as the 'feeder-demo-3kg' dummy feeder, so
 # the rest of the system (CV config, calibration, kg) works exactly like the real feeders.
 FEEDER_CLASS_NAMES = {0: "pan3kg", 1: "pan7kg", 2: "tube7kg"}
-FEEDER_CLASS_NAMES_M3 = {0: "feeder-demo-3kg"}
+# Method 3 reuses the Method-1 model (3 classes), but in the demo the only feeder IS the
+# cup — so EVERY class maps to the single demo type. run_feeder picks the highest-confidence
+# detection and labels it feeder-demo-3kg, whichever pan/tube class actually fired.
+FEEDER_CLASS_NAMES_M3 = {0: "feeder-demo-3kg", 1: "feeder-demo-3kg", 2: "feeder-demo-3kg"}
 FEEDER_TYPES = {"pan3kg", "pan7kg", "tube7kg", "feeder-demo-3kg"}
 
 
@@ -171,14 +176,21 @@ def apply_clahe(image: Image.Image, clip_limit: float = 2.0, tile_grid: int = 8)
     return Image.fromarray(rgb2)
 
 
-def run_feeder(image: Image.Image, conf: float = 0.25, method: int = 1) -> FeederResult:
+def run_feeder(image: Image.Image, conf: float | None = None, method: int = 1) -> FeederResult:
     """
     Run the feeder segmentation model (3-class: pan3kg/pan7kg/tube7kg).
 
     method 1 = whole-feeder polygon, method 2 = open-area polygon. Both return
     the feeder type + polygon/bbox used as the CV ROI; feed level is measured by
     the classical-CV pipeline (cv_feeder.py), NOT here.
+
+    conf defaults to 0.25 for the real feeders, but 0.15 for the demo (Method 3):
+    it borrows the Method-1 model on a small cup it only weakly detects on some
+    frames, so the lower threshold stops it dropping the cup (which would fall back
+    to the ROI box and misread that cycle).
     """
+    if conf is None:
+        conf = 0.15 if int(method) == 3 else 0.25
     model = load_feeder_model(method)
     arr = np.array(image.convert("RGB"))
     with _PREDICT_LOCK:
