@@ -282,7 +282,8 @@ def autonomous_cycle(cfg, cv_bundle, method, shared, alert_state):
     shared.latest_env = (temp, hum)
     age = config.chicken_age_days(cfg)
     row, coverage, _imgs, _ex = engine.analyze_image(cfg, cv_bundle, img, method, temp, hum, age)
-    synced = engine.commit_reading(cfg, row, coverage, source="worker", alert_state=alert_state)
+    synced = engine.commit_reading(cfg, row, coverage, source="worker", alert_state=alert_state,
+                                   feeder_detected=_ex.get("detected") is not None)
     print(f"[worker] (auto) feed={row['feed_kg']}kg cover={coverage:.0f}% "
           f"birds={row['chicken_count']} THI={row['thi_c']} cloud={'ok' if synced else 'local-only'}")
     return row, coverage

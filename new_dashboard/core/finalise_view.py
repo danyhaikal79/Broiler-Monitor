@@ -177,7 +177,8 @@ def _render_live(cfg, method, method_display, interval):
         last_log = st.session_state.get("fin_live_last_log", 0.0)
         if now - last_log >= interval:
             try:
-                engine.commit_reading(cfg, row, coverage, source="live", alert_state=_alert_state())
+                engine.commit_reading(cfg, row, coverage, source="live", alert_state=_alert_state(),
+                                      feeder_detected=extras.get("detected") is not None)
                 st.session_state["fin_live_last_log"] = now
                 log_note = " · ✅ logged"
             except Exception as e:
@@ -254,7 +255,8 @@ def _render_upload(cfg, method, method_display, interval):
                 st.error(f"⚠️ Couldn't analyze this file: {e}")
                 return
         if st.session_state.get("fin_upload_logged") != file_sig:
-            engine.commit_reading(cfg, row, coverage, source="upload", alert_state=_alert_state())
+            engine.commit_reading(cfg, row, coverage, source="upload", alert_state=_alert_state(),
+                                  feeder_detected=extras.get("detected") is not None)
             st.session_state["fin_upload_logged"] = file_sig
         st.session_state["fin_upload_cache"] = {
             "sig": analyze_sig, "row": row, "coverage": coverage, "images": images, "extras": extras}

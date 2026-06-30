@@ -32,14 +32,21 @@ def analyze_image(cfg, cv_bundle, img, method, temp, hum, age):
     `images` = the 4 readout views (PIL); `extras` = extra display numbers."""
     feeder = inference.run_feeder(img, method=method)
     chicken = inference.run_chicken(img, method=method)
-    ftype = feeder.feeder_type or cfg.get("feeder_type", "pan7kg")
-    cvm = cv_feeder.measure(img, cv_bundle, ftype,
-                            yolo_polygon=feeder.feeder_polygon, yolo_bbox=feeder.feeder_bbox)
-    fill = cvm.fill_ratio if cvm else 0.0
+    detected = feeder.feeder_type                          # None if no feeder is in view
+    ftype = detected or cfg.get("feeder_type", "pan7kg")   # a valid type for the CV / feed math
+    if detected is None:
+        # No feeder detected -> the feed reading is meaningless. Report 0 kg instead of
+        # measuring a fallback ROI of bedding (which produced a phantom non-zero weight).
+        cvm, fill, food_kg = None, 0.0, 0.0
+    else:
+        cvm = cv_feeder.measure(img, cv_bundle, ftype,
+                                yolo_polygon=feeder.feeder_polygon, yolo_bbox=feeder.feeder_bbox)
+        fill = cvm.fill_ratio if cvm else 0.0
+        food_kg = cvm.current_food_kg if cvm else 0.0
     _ov = cfg.get("chicken_count_override")
     count = _ov if _ov is not None else chicken.count
     pred = logic.compute(temperature_c=temp, humidity_pct=hum, age_days=age, chicken_count=count,
-                         current_food_kg=cvm.current_food_kg if cvm else 0.0, feeder_type=ftype)
+                         current_food_kg=food_kg, feeder_type=ftype)
     coverage = (100.0 * pred.current_food_kg / pred.flock_daily_required_kg
                 if pred.flock_daily_required_kg > 0 else 100.0)
     row = {
@@ -139,7 +146,7 @@ def _recent_alert(cfg, kind, cooldown_s) -> bool:
         return False
 
 
-def commit_reading(cfg, row, coverage, *, source="worker", alert_state=None):
+def commit_reading(cfg, row, coverage, *, source="worker", alert_state=None, feeder_detected=True):
     """Log one reading to the DB, then fire the low-feed + heat-emergency alerts.
 
     Cooldown is enforced two ways: a cheap in-process gate (`alert_state`, owned by the
@@ -158,7 +165,9 @@ def commit_reading(cfg, row, coverage, *, source="worker", alert_state=None):
     tg = config.is_telegram_configured(cfg)
     tag = "" if source == "worker" else source
 
-    if coverage < low_thr and int(row.get("chicken_count", 0)) > 0 \
+    # low-feed alert only when a feeder was actually detected: no feeder in view means the
+    # feed is "unavailable", not "empty" — don't cry wolf when the cup is just out of frame.
+    if coverage < low_thr and int(row.get("chicken_count", 0)) > 0 and feeder_detected \
             and now - alert_state.get("last_low", 0.0) >= cooldown:
         if not _recent_alert(cfg, "low_feed", cooldown):   # not already sent by either side
             if tg:
