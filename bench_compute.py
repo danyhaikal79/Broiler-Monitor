@@ -70,12 +70,23 @@ def main():
     cv_bundle = cv_feeder.CVConfigBundle.load(cv_feeder.config_path_for(method), method)
 
     imgs = load_images(sys.argv[1]) if len(sys.argv) > 1 else []
+    from_camera = False
     if not imgs:
         print("no image folder given (or empty) -> grabbing one frame from the camera")
         imgs = grab_one_from_camera(cfg)
+        from_camera = True
     if not imgs:
         print("ERROR: no images and no camera frame; pass an image folder")
         sys.exit(1)
+    # When grabbed from the camera, save it LOSSLESS (PNG) so the exact same frame can be
+    # copied to another machine and benchmarked there for a truly identical comparison.
+    if from_camera:
+        try:
+            imgs[0].save("bench_frame.png")
+            print(f"saved captured frame -> {Path('bench_frame.png').resolve()}")
+            print("   (copy this file to the other machine and run:  bench_compute.py bench_frame.png 3)")
+        except Exception as e:
+            print(f"(could not save frame: {e})")
 
     # device + which weights actually loaded (.pt vs TensorRT .engine)
     try:
