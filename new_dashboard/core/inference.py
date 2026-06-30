@@ -192,13 +192,15 @@ def run_feeder(image: Image.Image, conf: float | None = None, method: int = 1) -
     if conf is None:
         conf = 0.15 if int(method) == 3 else 0.25
     model = load_feeder_model(method)
-    # NB: hand the model a numpy array (Ultralytics reads numpy as BGR). Unlike
-    # run_chicken, do NOT "fix" this to a PIL/RGB image — the feeder model detects the
-    # metal cup FAR better on this path (correct-colour input dropped cup detections to
-    # ~0 in testing). Re-verify detection counts before ever changing this.
-    arr = np.array(image.convert("RGB"))
+    # Colour path is METHOD-AWARE (Ultralytics reads numpy as BGR, PIL as RGB):
+    #  - Methods 1/2 = the real, COLOURFUL feeders. Their models were trained on correct
+    #    colours, so pass the PIL image (RGB) — swapping R/B hurts detection on coloured feed.
+    #  - Method 3 = the demo metal cup via the Method-1 model. That cup is out-of-distribution
+    #    for the model and is only detected reliably on the SWAPPED (numpy/BGR) path: correct
+    #    colours drop cup detections to ~0. So feed Method 3 a numpy array on purpose.
+    src = np.array(image.convert("RGB")) if int(method) == 3 else image.convert("RGB")
     with _PREDICT_LOCK:
-        results = model.predict(arr, conf=conf, verbose=False)
+        results = model.predict(src, conf=conf, verbose=False)
     res = results[0]
 
     pan_area = 0.0
